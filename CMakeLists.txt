@@ -2,17 +2,13 @@
 # Licensed under the MIT License.
 
 cmake_minimum_required(VERSION 3.26)
+#Please set all pre-compile variables in the set_variables.cmake file
+include(cmake/set_variables.cmake)
 include(FetchContent)
 include(cmake/external/onnxruntime_external_deps.cmake)
 
 project(Generators LANGUAGES C CXX)
-set(USE_CUDA 1) # "Build with CUDA support"
-set(USE_TOKENIZER 1) # "Build with Tokenizer support"
-set(BUILD_WHEEL 1)
 
-# Checking if CUDA is supported
-include(CheckLanguage)
-check_language(CUDA)
 if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 9)
   message(FATAL_ERROR "GCC version must be greater than or equal to 9")
 endif()
@@ -24,9 +20,8 @@ if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_
 else()
   set(CMAKE_CXX_STANDARD 20)
 endif()
-
+add_subdirectory(src)
 set(GENERATORS_ROOT ${PROJECT_SOURCE_DIR}/src)
-set(MODELS_ROOT ${PROJECT_SOURCE_DIR}/src/models)
 set(TESTS_ROOT ${PROJECT_SOURCE_DIR}/src/tests)
 set(PYTHON_ROOT ${PROJECT_SOURCE_DIR}/src/python)
 
@@ -38,12 +33,7 @@ endif()
 
 message(STATUS "Adding source files")
 
-file(GLOB generator_srcs CONFIGURE_DEPENDS
-   "${GENERATORS_ROOT}/*.h"
-   "${GENERATORS_ROOT}/*.cpp"
-   "${MODELS_ROOT}/*.h"
-   "${MODELS_ROOT}/*.cpp"
-)
+
 
 file(GLOB test_srcs CONFIGURE_DEPENDS
    "${TESTS_ROOT}/*.h"
@@ -93,19 +83,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_target_properties(onnxruntime-genai PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
-if(WIN32)
-  set(ONNXRUNTIME_LIB "onnxruntime.lib")
-  set(ONNXRUNTIME_FILES "onnxruntime*.dll")
-  set(ONNXRUNTIME_EXTENSIONS_LIB "tfmtok_c.lib")
-  set(ONNXRUNTIME_EXTENSIONS_FILES "tfmtok_c.dll")
-elseif(APPLE)
-  set(ONNXRUNTIME_LIB "libonnxruntime.dylib")
-  set(ONNXRUNTIME_FILES "libonnxruntime*.dylib")
-else()
-  set(ONNXRUNTIME_LIB "libonnxruntime.so")
-  set(ONNXRUNTIME_FILES "libonnxruntime*.so*")
-  set(ONNXRUNTIME_EXTENSIONS_LIB "tfmtok_c.so")
-endif()
+
 
 add_executable(Tests ${test_srcs})
 target_include_directories(Tests PRIVATE ${CMAKE_SOURCE_DIR}/ort/include)
