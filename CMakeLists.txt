@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.26)
 include(cmake/set_variables.cmake)
 include(FetchContent)
 include(cmake/external/onnxruntime_external_deps.cmake)
-
+set (ORT_HEADERS_DIR ${CMAKE_SOURCE_DIR}/ort/include)
 project(Generators LANGUAGES C CXX)
 
 if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 9)
@@ -45,34 +45,6 @@ file(GLOB python_srcs CMAKE_CONFIGURE_DEPENDS
    "${PYTHON_ROOT}/*.cpp"
 )
 
-if(USE_CUDA AND CMAKE_CUDA_COMPILER)
-  # Don't let cmake set a default value for CMAKE_CUDA_ARCHITECTURES
-  cmake_policy(SET CMP0104 OLD)
-  enable_language(CUDA)
-  message(STATUS "CMAKE_CUDA_COMPILER_VERSION: ${CMAKE_CUDA_COMPILER_VERSION}")
-  # set(CUDA_PROPAGATE_HOST_FLAGS ON)
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcudafe --diag_suppress=2803 --expt-relaxed-constexpr")
-  file(GLOB generator_cuda_srcs CONFIGURE_DEPENDS
-     "${GENERATORS_ROOT}/*.cu"
-     "${GENERATORS_ROOT}/*.cuh"
-     "${MODELS_ROOT}/*.cu"
-     "${MODELS_ROOT}/*.cuh"
-  )
-  list(APPEND generator_srcs ${generator_cuda_srcs})
-  add_compile_definitions(USE_CUDA=1)
-  include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
-else()
-  file(GLOB generator_cuda_srcs "${GENERATORS_ROOT}/*_cuda*.*")
-  list(REMOVE_ITEM generator_srcs ${generator_cuda_srcs})
-endif()
-
-## TODO: this is a hack to get the shared library to export .lib files on windows. We should find a better way when we need to compile dynamic libraries
-#if(WIN32)
-#    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-#endif()
-
-add_library(onnxruntime-genai ${generator_srcs})
-target_include_directories(onnxruntime-genai PRIVATE ${CMAKE_SOURCE_DIR}/ort/include)
 
 if(USE_TOKENIZER)
   add_subdirectory("${CMAKE_SOURCE_DIR}/src/tokenizer")
