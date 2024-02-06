@@ -5,11 +5,43 @@ cmake_minimum_required(VERSION 3.26)
 include(FetchContent)
 include(cmake/external/onnxruntime_external_deps.cmake)
 
+
 project(Generators LANGUAGES C CXX)
 option(USE_CUDA "Build with CUDA support" ON)
 option(USE_TOKENIZER "Build with Tokenizer support" ON)
 option(ENABLE_PYTHON "Enable python buildings" ON)
 cmake_dependent_option(BUILD_WHEEL "Build the python wheel" ON "ENABLE_PYTHON" ON)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-linux-aarch64-1.17.0.tgz")
+  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-linux-x64-1.17.0.tgz")
+  else()
+    message(FATAL_ERROR "Unsupported Linux architecture ${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-win-x64-1.17.0.zip")
+  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-win-arm64-1.17.0.zip")
+  else()
+    message(FATAL_ERROR "Unsupported Windows architecture ${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(ONNXRUNTIME_URL "https://github.com/microsoft/onnxruntime/releases/download/v1.17.0/onnxruntime-osx-universal2-1.17.0.tgz")
+else()
+  message(FATAL_ERROR "Unsupported OS ${CMAKE_SYSTEM_NAME} and ARCH ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+include(ExternalProject)
+ExternalProject_Add(
+   onnxruntime
+   PREFIX ${CMAKE_SOURCE_DIR}/ort
+   URL ${ONNXRUNTIME_URL}
+   DOWNLOAD_NAME "ort.zpi"
+)
+
 
 # Checking if CUDA is supported
 include(CheckLanguage)
@@ -196,10 +228,10 @@ if(BUILD_WHEEL)
   endforeach(filename)
 
   add_custom_target(PyPackageBuild ALL
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:python> ${WHEEL_FILES_DIR}/${TARGET_NAME}
-    COMMAND "${PYTHON_EXECUTABLE}" -m pip wheel .
-    WORKING_DIRECTORY "${WHEEL_FILES_DIR}"
-    COMMENT "Building wheel"
+     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:python> ${WHEEL_FILES_DIR}/${TARGET_NAME}
+     COMMAND "${PYTHON_EXECUTABLE}" -m pip wheel .
+     WORKING_DIRECTORY "${WHEEL_FILES_DIR}"
+     COMMENT "Building wheel"
   )
 
   add_dependencies(PyPackageBuild python)
