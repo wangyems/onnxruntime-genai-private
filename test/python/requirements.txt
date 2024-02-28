@@ -1,2 +1,6 @@
 numpy
 pytest
+onnx
+onnxruntime_gpu
+transformers
+torch
