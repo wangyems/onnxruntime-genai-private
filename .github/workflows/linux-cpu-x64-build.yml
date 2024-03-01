@@ -1,5 +1,5 @@
 name: "Linux CPU x64 Build"
-on:
+on: |
   workflow_dispatch:
   schedule:
     # Run at 5:00 AM UTC every day
