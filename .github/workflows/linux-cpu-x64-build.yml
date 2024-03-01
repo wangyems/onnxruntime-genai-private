@@ -1,11 +1,5 @@
 name: "Linux CPU x64 Build"
-on: |
-  workflow_dispatch:
-  schedule:
-    # Run at 5:00 AM UTC every day
-    # 9:00 PM PST
-    - cron: "0 5 * * *"
-    push:
+on: [ workflow_dispatch, pull_request ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
