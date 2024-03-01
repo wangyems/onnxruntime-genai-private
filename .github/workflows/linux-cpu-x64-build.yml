@@ -56,11 +56,10 @@ jobs:
       - name: Get HuggingFace Token
         run: |
           az login --identity --username 63b63039-6328-442f-954b-5a64d124e5b4
-          echo token=$(az keyvault secret show --vault-name anubissvcsecret --name ANUBIS-HUGGINGFACE-TOKEN --query value) >> $GITHUB_ENV
+          echo HF_TOKEN=$(az keyvault secret show --vault-name anubissvcsecret --name ANUBIS-HUGGINGFACE-TOKEN --query value) >> $GITHUB_ENV
 
       - name: Run the python tests
         run: |
-          huggingface-cli login --token ${{ env.token }}
           python3 test/python/test_onnxruntime_genai.py --cwd test/python --test_models test/test_models --e2e
 
       - name: Verify Build Artifacts
