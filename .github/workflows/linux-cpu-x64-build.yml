@@ -55,7 +55,7 @@ jobs:
 
       - name: Get HuggingFace Token
         run: |
-          az login --identity -u /subscriptions/00c06639-6ee4-454e-8058-8d8b1703bd87/resourcegroups/jozh-dev-anubis/providers/Microsoft.ManagedIdentity/userAssignedIdentities/AnubisPocAgentIdentity
+          az login --identity --username 63b63039-6328-442f-954b-5a64d124e5b4
           echo token=$(az keyvault secret show --vault-name anubissvcsecret --name ANUBIS-HUGGINGFACE-TOKEN --query value) >> $GITHUB_ENV
 
       - name: Run the python tests
