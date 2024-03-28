@@ -947,6 +947,46 @@ class Model:
         # Assign output 0 of previous MatMul as skip input to next SkipLayerNorm
         self.layernorm_attrs["skip_input"] = f"{down_name}/output_0"
 
+    def make_block_sparse_moe(self, layer_id, bsm, root_input, num_experts, top_k, activation_type, normalize_routing_weights):
+        # Make MatMul nodes
+        gate_name = f"/model/layers.{layer_id}/moe/gate/MatMul"
+        self.make_matmul(bsm.gate.weight.detach().numpy(), gate_name, root_input)
+
+        moe_name = f"/model/layers.{layer_id}/moe"
+        w1_list = []
+        w2_list = []
+        w3_list = []
+
+        hidden_size = self.hidden_size
+        inter_size = self.intermediate_size
+
+        for i in range(num_experts):
+            w1_list.append(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)))
+            w2_list.append(torch.reshape(bsm.experts[i].w2.weight, (inter_size, hidden_size)))
+            w3_list.append(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)))
+
+        moe_expert_1_name = f"model.layers.{layer_id}.moe.weight_1"
+        moe_expert_2_name = f"model.layers.{layer_id}.moe.weight_2"
+        moe_expert_3_name = f"model.layers.{layer_id}.moe.weight_3"
+
+        moe_experts_weight1 = torch.stack(w1_list, dim=0).detach().numpy()
+        moe_experts_weight2 = torch.stack(w2_list, dim=0).detach().numpy()
+        moe_experts_weight3 = torch.stack(w3_list, dim=0).detach().numpy()
+
+        self.make_external_tensor(moe_experts_weight1.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_1_name)
+        self.make_external_tensor(moe_experts_weight2.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_2_name)
+        self.make_external_tensor(moe_experts_weight3.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_3_name)
+
+        bias_ph = "" # Placeholder for bias
+        inputs = [root_input, f"{gate_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
+        output = f"{moe_name}/output_0"
+        self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft", 
+                        k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights)
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+
+        # Assign output 0 of previous MoE as root input to next SkipLayerNorm
+        self.layernorm_attrs["root_input"] = output
+
     def make_activation_with_mul(self, layer_id, root_input, activation, domain):
         # Make nodes for this activation subgraph
         #
@@ -1006,7 +1046,8 @@ class Model:
         self.make_layernorm(layer_id, layer.input_layernorm, skip=not self.layernorm_attrs["first_layernorm"], simple=self.layernorm_attrs["simple"], location="input")
         self.make_attention(layer_id, layer.self_attn, self.layernorm_attrs["output_0"])
         self.make_layernorm(layer_id, layer.post_attention_layernorm, skip=True, simple=self.layernorm_attrs["simple"], location="post_attention")
-        self.make_mlp(layer_id, layer.mlp, self.layernorm_attrs["output_0"])
+        # self.make_mlp(layer_id, layer.mlp, self.layernorm_attrs["output_0"])
+        self.make_block_sparse_moe(layer_id, layer.block_sparse_moe, self.layernorm_attrs["output_0"], 8, 2, "silu", 1)
 
         self.layernorm_attrs["first_layernorm"] = False
         if layer_id == self.num_layers - 1:
@@ -1534,6 +1575,10 @@ class GemmaModel(MistralModel):
         self.embed_attrs["normalize"] = True
         self.layernorm_attrs["add_offset"] = 1
 
+class MixtralModel(MistralModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options) 
+
 
 def parse_extra_options(kv_items):
     """
@@ -1573,6 +1618,8 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model = MistralModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "PhiForCausalLM":
             onnx_model = PhiModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "MixtralForCausalLM":
+            onnx_model = MixtralModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         else:
             raise NotImplementedError(f"The {hf_name} model is not currently supported.")
 

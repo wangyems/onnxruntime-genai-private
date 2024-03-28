@@ -1,0 +1,1 @@
+python builder.py -m mistralai/Mixtral-8x7B-v0.1 -e cuda -p fp16 -o ./example-models/mixtral --extra_options num_hidden_layers=4
