@@ -41,7 +41,11 @@ class Model:
         self.cache_dir = cache_dir
         self.filename = extra_options["filename"] if "filename" in extra_options else "model.onnx"
         self.extra_options = extra_options
-        
+
+        # bugbug
+        self.num_shards = 2
+        self.shard_id = 1
+
         self.inputs = []
         self.outputs = []
         self.initializers = []
@@ -75,7 +79,7 @@ class Model:
             TensorProto.FLOAT16: "TensorProto.FLOAT16",
             TensorProto.FLOAT: "TensorProto.FLOAT",
         }
-        
+
         # Mask-specific variables
         self.mask_attrs = {
             "mask_name": "",            # Name of node that outputs 4D causal attention mask (used as add_qk in MultiHeadAttention)
@@ -481,7 +485,7 @@ class Model:
     def make_add_bias(self, add, name, root_input, **kwargs):
         bias = name[1:].replace("/", ".") + ".bias"
         self.make_external_tensor(add.astype(self.to_numpy_dtype[self.io_dtype]), bias)
-        
+
         add_bias_inputs = [root_input, bias]
         shape = ['batch_size', 'sequence_length', add.shape[0]]
 
@@ -491,6 +495,11 @@ class Model:
             self.make_value_info(output, dtype=self.io_dtype, shape=shape)
         else:
             self.make_add(name, add_bias_inputs, dtype=self.io_dtype, shape=shape)
+
+    def make_all_reduce(self, name, root_input):
+        output = f"{name}/output_0"
+        self.make_node("AllReduce", inputs=[root_input], outputs=[output], name=name)
+        # self.make_value_info(output, dtype, shape=shape)
 
     def make_embedding(self, embedding):
         weight = "model.embed_tokens.weight"
@@ -609,7 +618,7 @@ class Model:
         #                |   present_kv
         #                |
         #        +-------+---------+
-        #        |                 |        
+        #        |                 |
         #        |               Shape
         #        |                 |
         #        |     +-----------+-----------+-----------+
@@ -682,7 +691,7 @@ class Model:
         concat_1_name = f"{basename}/Concat_1"
         concat_1_inputs = [past_kv, f"{transpose_1_name}/output_0"]
         self.make_node("Concat", inputs=concat_1_inputs, outputs=[present_kv], name=concat_1_name, axis=2)
-        
+
         shape_1_name = f"{basename}/Shape_1"
         self.make_shape(shape_1_name, present_kv, shape=[4])
         gather_1_name = f"{basename}/Gather_1"
@@ -771,7 +780,7 @@ class Model:
 
     def make_attention_op(self, name, **kwargs):
         op_type = self.attention_attrs["op_type"]
-        
+
         if op_type == "MultiHeadAttention":
             self.make_multi_head_attention(name, add_qk=f"{self.mask_attrs['mask_name']}/output_0", **kwargs)
         elif op_type == "GroupQueryAttention":
@@ -798,7 +807,11 @@ class Model:
         ]
         output = f"{name}/output_0"
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
-        self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, local_window_size=self.window_size)
+        if self.num_shards > 1:
+            # bugbug: scale is hardcoded to 0.0883883461356163
+            self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads / self.num_shards, kv_num_heads=self.num_kv_heads / self.num_shards, local_window_size=self.window_size, scale=0.0883883461356163)
+        else:
+            self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, local_window_size=self.window_size)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
 
     def make_attention(self, layer_id, attention, root_input, **kwargs):
@@ -842,13 +855,33 @@ class Model:
 
         # Make MatMul nodes
         q_matmul_name = f"/model/layers.{layer_id}/attn/q_proj/MatMul"
-        self.make_matmul(attention.q_proj.weight.detach().numpy(), q_matmul_name, root_input)
+        if self.num_shards > 1:
+            local_dim1 = attention.q_proj.weight.shape[1] // self.num_shards
+            start = self.shard_id * local_dim1
+            end = start + local_dim1
+            self.make_matmul(attention.q_proj.weight.detach().numpy()[:, start : end], q_matmul_name, root_input)
+        else:
+            self.make_matmul(attention.q_proj.weight.detach().numpy(), q_matmul_name, root_input)
         q_input_to_attention = f"{q_matmul_name}/output_0"
+
         k_matmul_name = f"/model/layers.{layer_id}/attn/k_proj/MatMul"
-        self.make_matmul(attention.k_proj.weight.detach().numpy(), k_matmul_name, root_input)
+        if self.num_shards > 1:
+            local_dim1 = attention.k_proj.weight.shape[1] // self.num_shards
+            start = self.shard_id * local_dim1
+            end = start + local_dim1
+            self.make_matmul(attention.k_proj.weight.detach().numpy()[:, start : end], k_matmul_name, root_input)
+        else:
+            self.make_matmul(attention.k_proj.weight.detach().numpy(), k_matmul_name, root_input)
         k_input_to_attention = f"{k_matmul_name}/output_0"
+
         v_matmul_name = f"/model/layers.{layer_id}/attn/v_proj/MatMul"
-        self.make_matmul(attention.v_proj.weight.detach().numpy(), v_matmul_name, root_input)
+        if self.num_shards > 1:
+            local_dim1 = attention.v_proj.weight.shape[1] // self.num_shards
+            start = self.shard_id * local_dim1
+            end = start + local_dim1
+            self.make_matmul(attention.v_proj.weight.detach().numpy()[:, start : end], v_matmul_name, root_input)
+        else:
+            self.make_matmul(attention.v_proj.weight.detach().numpy(), v_matmul_name, root_input)
         v_input_to_attention = f"{v_matmul_name}/output_0"
 
         # Make Add nodes (if bias exists)
@@ -856,6 +889,7 @@ class Model:
         k_bias_exists = attention.k_proj.bias is not None
         v_bias_exists = attention.v_proj.bias is not None
 
+        # bugbug: handle shards for bias
         if q_bias_exists:
             q_add_name = f"/model/layers.{layer_id}/attn/q_proj/Add"
             self.make_add_bias(attention.q_proj.bias.detach().numpy(), q_add_name, root_input=f"{q_matmul_name}/output_0")
@@ -901,7 +935,13 @@ class Model:
         o_proj = 'o_proj' if hasattr(attention, 'o_proj') else 'dense'
         o_matmul_name = f"/model/layers.{layer_id}/attn/o_proj/MatMul"
         o_weight = eval(f"attention.{o_proj}.weight.detach().numpy()")
-        self.make_matmul(o_weight, o_matmul_name, f"{attn_name}/output_0")
+        if self.num_shards > 1:
+            local_dim0 = o_weight.shape[0] // self.num_shards
+            start = self.shard_id * local_dim0
+            end = start + local_dim0
+            self.make_matmul(o_weight[start : end, :], o_matmul_name, f"{attn_name}/output_0")
+        else:
+            self.make_matmul(o_weight, o_matmul_name, f"{attn_name}/output_0")
 
         # Make Add node (output projection bias node if bias exists)
         o_bias_exists = eval(f"attention.{o_proj}.bias") is not None
@@ -910,8 +950,16 @@ class Model:
             o_bias = eval(f"attention.{o_proj}.bias.detach().numpy()")
             self.make_add_bias(o_bias, o_add_name, root_input=f"{o_matmul_name}/output_0")
 
+        if self.num_shards > 1:
+            assert not o_bias_exists
+            all_reduce_name = f"/model/layers.{layer_id}/attn/o_proj/AllReduce"
+            self.make_all_reduce(all_reduce_name, f"{o_matmul_name}/output_0")
+
         # Assign output 0 of previous output node as skip input to next SkipLayerNorm
         self.layernorm_attrs["skip_input"] = f"{o_matmul_name if not o_bias_exists else o_add_name}/output_0"
+        # bugbug
+        if self.num_shards > 1:
+            self.layernorm_attrs["skip_input"] = f"{all_reduce_name}/output_0"
 
     def make_mlp(self, layer_id, mlp, root_input):
         # Make nodes for the MLP subgraph
@@ -925,7 +973,7 @@ class Model:
         #             Mul
         #              |
         #        DownProjMatMul
-        
+
         # Make MatMul nodes
         gate_name = f"/model/layers.{layer_id}/mlp/gate_proj/MatMul"
         self.make_matmul(mlp.gate_proj.weight.detach().numpy(), gate_name, root_input)
@@ -980,7 +1028,7 @@ class Model:
         bias_ph = "" # Placeholder for bias
         inputs = [root_input, f"{gate_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
         output = f"{moe_name}/output_0"
-        self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft", 
+        self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
                         k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
@@ -1077,7 +1125,7 @@ class Model:
             # Load PyTorch model
             extra_kwargs = {} if os.path.exists(self.model_name_or_path) else {"num_hidden_layers": self.num_layers} if "num_hidden_layers" in self.extra_options else {"cache_dir": self.cache_dir, "use_auth_token": True}
             model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, **extra_kwargs)
-        
+
         # Loop through model and map each module to ONNX/ORT ops
         self.layer_id = 0
         for module in model.modules():
@@ -1119,9 +1167,9 @@ class Model:
         #            /         \               |
         #         Shape       Shape          Shape
         #          |            |              |
-        #        Gather       Gather         Gather                              
+        #        Gather       Gather         Gather
         #       (idx=0)       (idx=1)        (idx=2)
-        #          |            |    |\      /                                        
+        #          |            |    |\      /
         #          |            |    | \    /
         #          |            |    |   Add                                      attention_mask--------+
         #          |            |    |    |                                       /           \         |
@@ -1258,7 +1306,7 @@ class Model:
         concat_3_name = f"{basename}/Concat_3"
         concat_3_inputs = [f"{unsqueeze_7_name}/output_0", "/model/constants/TensorProto.INT64/1D/1"]
         self.make_concat(concat_3_name, concat_3_inputs, dtype=TensorProto.INT64, shape=[2], axis=0)
-        
+
         # Bottom path
         shape_5_name = f"{basename}/Shape_5"
         self.make_shape(shape_5_name, f"{constant_shape_name}/output_0", shape=[2])
@@ -1334,7 +1382,7 @@ class Model:
         #            /         \
         #         Shape       Shape
         #          |            |
-        #        Gather       Gather                              
+        #        Gather       Gather
         #       (idx=0)       (idx=1)
         #          |            |
         #      Unsqueeze   Unsqueeze   Unsqueeze (unsqueeze_for_concat)
@@ -1382,7 +1430,7 @@ class Model:
         unsqueeze_2_name = f"{basename}/Unsqueeze_2"
         unsqueeze_2_inputs = [f"{gather_2_name}/output_0", "/model/constants/TensorProto.INT64/1D/0"]
         self.make_unsqueeze(unsqueeze_2_name, unsqueeze_2_inputs, dtype=TensorProto.INT64, shape=[1])
-        
+
         concat_name = f"{basename}/Concat" if not input_ids_subgraph else f"{basename}/Concat_1"
         concat_first_two_inputs = [f"{unsqueeze_1_name}/output_0", "/model/constants/TensorProto.INT64/1D/1"]
         concat_last_two_inputs = [f"{unsqueeze_for_concat}/output_0", f"{unsqueeze_2_name}/output_0"] if not input_ids_subgraph else [f"{unsqueeze_2_name}/output_0", f"{unsqueeze_for_concat}/output_0"]
@@ -1399,7 +1447,7 @@ class Model:
         equal_name = f"{basename}/Equal"
         equal_inputs = [f"{concat_name}/output_0", f"{mul_name}/output_0"]
         self.make_equal(equal_name, equal_inputs, shape=[4])
-        
+
         where_name = f"{basename}/Where_1"
         where_inputs = [f"{equal_name}/output_0", f"{constant_shape_name}/output_0", f"{concat_name}/output_0"]
         self.make_where(where_name, where_inputs, dtype=TensorProto.INT64, shape=[4])
@@ -1410,7 +1458,7 @@ class Model:
         self.make_expand(expand_name, expand_inputs, dtype=expand_dtype, shape=expand_shape)
 
         return expand_name
-    
+
 
 class LlamaModel(Model):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
@@ -1422,7 +1470,7 @@ class LlamaModel(Model):
             super().make_attention_mask_reformatting()
             return
 
-        # Make nodes for the attention mask subgraph that calculates 
+        # Make nodes for the attention mask subgraph that calculates
         # attributes about the 2D attention mask to use in GroupQueryAttention
         #
         #                attention_mask
@@ -1482,7 +1530,7 @@ class MistralModel(LlamaModel):
         #                  \       /
         #                   Reshape
         #                      |
-        #      position_ids input for RotaryEmbedding       
+        #      position_ids input for RotaryEmbedding
 
         basename = "/model/pos_ids_reformat"
         shape_name = f"{basename}/Shape"
@@ -1516,7 +1564,7 @@ class PhiModel(LlamaModel):
 
     def make_rotary_embedding(self, rotemb, name, root_input, **kwargs):
         super().make_rotary_embedding(rotemb, name, root_input, num_heads=self.rotemb_attrs["num_heads"], rotary_embedding_dim=self.rotemb_attrs["rotary_embedding_dim"], **kwargs)
-        
+
     def make_mlp(self, layer_id, mlp, root_input):
         # Make nodes for the MLP subgraph
         #
@@ -1564,7 +1612,7 @@ class PhiModel(LlamaModel):
         if layer_id == self.num_layers - 1:
             # Norm after last decoder layer of model (last layer --> norm)
             self.layernorm_attrs["last_layernorm"] = True
-        
+
         # Assign output 0 of residual Add as skip input to next SkipLayerNorm
         self.layernorm_attrs["skip_input"] = f"{residual_add_name}/output_0"
 
@@ -1577,7 +1625,7 @@ class GemmaModel(MistralModel):
 
 class MixtralModel(MistralModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
-        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options) 
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
 
 def parse_extra_options(kv_items):
@@ -1585,7 +1633,7 @@ def parse_extra_options(kv_items):
     Parse key value pairs that are separated by '='
     """
     kv_pairs = {}
-    
+
     if kv_items:
         for kv_str in kv_items:
             kv = kv_str.split('=')
