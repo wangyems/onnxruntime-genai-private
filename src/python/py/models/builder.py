@@ -43,8 +43,9 @@ class Model:
         self.extra_options = extra_options
 
         # bugbug
-        self.num_shards = 2
-        self.shard_id = 1
+        self.world_size = int(extra_options["world_size"]) if "world_size" in extra_options else 1
+        self.rank = int(extra_options["rank"]) if "rank" in extra_options else 0
+        print(f"world_size: {self.world_size}, rank: {self.rank}")
 
         self.inputs = []
         self.outputs = []
@@ -807,9 +808,9 @@ class Model:
         ]
         output = f"{name}/output_0"
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
-        if self.num_shards > 1:
+        if self.world_size > 1:
             # bugbug: scale is hardcoded to 0.0883883461356163
-            self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads / self.num_shards, kv_num_heads=self.num_kv_heads / self.num_shards, local_window_size=self.window_size, scale=0.0883883461356163)
+            self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads / self.world_size, kv_num_heads=self.num_kv_heads / self.world_size, local_window_size=self.window_size, scale=0.0883883461356163)
         else:
             self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, local_window_size=self.window_size)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
@@ -855,9 +856,9 @@ class Model:
 
         # Make MatMul nodes
         q_matmul_name = f"/model/layers.{layer_id}/attn/q_proj/MatMul"
-        if self.num_shards > 1:
-            local_dim1 = attention.q_proj.weight.shape[1] // self.num_shards
-            start = self.shard_id * local_dim1
+        if self.world_size > 1:
+            local_dim1 = attention.q_proj.weight.shape[1] // self.world_size
+            start = self.rank * local_dim1
             end = start + local_dim1
             self.make_matmul(attention.q_proj.weight.detach().numpy()[:, start : end], q_matmul_name, root_input)
         else:
@@ -865,9 +866,9 @@ class Model:
         q_input_to_attention = f"{q_matmul_name}/output_0"
 
         k_matmul_name = f"/model/layers.{layer_id}/attn/k_proj/MatMul"
-        if self.num_shards > 1:
-            local_dim1 = attention.k_proj.weight.shape[1] // self.num_shards
-            start = self.shard_id * local_dim1
+        if self.world_size > 1:
+            local_dim1 = attention.k_proj.weight.shape[1] // self.world_size
+            start = self.rank * local_dim1
             end = start + local_dim1
             self.make_matmul(attention.k_proj.weight.detach().numpy()[:, start : end], k_matmul_name, root_input)
         else:
@@ -875,9 +876,9 @@ class Model:
         k_input_to_attention = f"{k_matmul_name}/output_0"
 
         v_matmul_name = f"/model/layers.{layer_id}/attn/v_proj/MatMul"
-        if self.num_shards > 1:
-            local_dim1 = attention.v_proj.weight.shape[1] // self.num_shards
-            start = self.shard_id * local_dim1
+        if self.world_size > 1:
+            local_dim1 = attention.v_proj.weight.shape[1] // self.world_size
+            start = self.rank * local_dim1
             end = start + local_dim1
             self.make_matmul(attention.v_proj.weight.detach().numpy()[:, start : end], v_matmul_name, root_input)
         else:
@@ -935,9 +936,9 @@ class Model:
         o_proj = 'o_proj' if hasattr(attention, 'o_proj') else 'dense'
         o_matmul_name = f"/model/layers.{layer_id}/attn/o_proj/MatMul"
         o_weight = eval(f"attention.{o_proj}.weight.detach().numpy()")
-        if self.num_shards > 1:
-            local_dim0 = o_weight.shape[0] // self.num_shards
-            start = self.shard_id * local_dim0
+        if self.world_size > 1:
+            local_dim0 = o_weight.shape[0] // self.world_size
+            start = self.rank * local_dim0
             end = start + local_dim0
             self.make_matmul(o_weight[start : end, :], o_matmul_name, f"{attn_name}/output_0")
         else:
@@ -950,7 +951,7 @@ class Model:
             o_bias = eval(f"attention.{o_proj}.bias.detach().numpy()")
             self.make_add_bias(o_bias, o_add_name, root_input=f"{o_matmul_name}/output_0")
 
-        if self.num_shards > 1:
+        if self.world_size > 1:
             assert not o_bias_exists
             all_reduce_name = f"/model/layers.{layer_id}/attn/o_proj/AllReduce"
             self.make_all_reduce(all_reduce_name, f"{o_matmul_name}/output_0")
@@ -958,7 +959,7 @@ class Model:
         # Assign output 0 of previous output node as skip input to next SkipLayerNorm
         self.layernorm_attrs["skip_input"] = f"{o_matmul_name if not o_bias_exists else o_add_name}/output_0"
         # bugbug
-        if self.num_shards > 1:
+        if self.world_size > 1:
             self.layernorm_attrs["skip_input"] = f"{all_reduce_name}/output_0"
 
     def make_mlp(self, layer_id, mlp, root_input):
@@ -1021,6 +1022,29 @@ class Model:
         moe_experts_weight2 = torch.stack(w2_list, dim=0).detach().numpy()
         moe_experts_weight3 = torch.stack(w3_list, dim=0).detach().numpy()
 
+        if self.world_size > 1:
+            def get_fc1_tensor_shards(expert_weights):
+                return (
+                    expert_weights.reshape(-1, inter_size, hidden_size)
+                    .transpose(0, 2, 1)[
+                        :, :, self.rank * inter_size // self.world_size : (self.rank + 1) * inter_size // self.world_size
+                    ]
+                    .transpose(0, 2, 1)
+                )
+
+            def get_fc2_tensor_shards(expert_weights):
+                return (
+                    expert_weights.reshape(-1, hidden_size, inter_size)
+                    .transpose(0, 2, 1)[
+                        :, self.rank * inter_size // self.world_size : (self.rank + 1) * inter_size // self.world_size, :
+                    ]
+                    .transpose(0, 2, 1)
+                )
+
+            moe_experts_weight1 = get_fc1_tensor_shards(moe_experts_weight1)
+            moe_experts_weight2 = get_fc2_tensor_shards(moe_experts_weight2)
+            moe_experts_weight3 = get_fc1_tensor_shards(moe_experts_weight3)
+
         self.make_external_tensor(moe_experts_weight1.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_1_name)
         self.make_external_tensor(moe_experts_weight2.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_2_name)
         self.make_external_tensor(moe_experts_weight3.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_3_name)
@@ -1033,7 +1057,7 @@ class Model:
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
         # Assign output 0 of previous MoE as root input to next SkipLayerNorm
-        self.layernorm_attrs["root_input"] = output
+        self.layernorm_attrs["skip_input"] = output
 
     def make_activation_with_mul(self, layer_id, root_input, activation, domain):
         # Make nodes for this activation subgraph
