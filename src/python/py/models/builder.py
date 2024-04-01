@@ -323,15 +323,15 @@ class Model:
         for i in range(self.num_layers):
             # Add KV cache to inputs
             key_name = f"past_key_values.{i}.key"
-            inputs.append(helper.make_tensor_value_info(key_name, self.io_dtype, shape=["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size]))
+            inputs.append(helper.make_tensor_value_info(key_name, self.io_dtype, shape=["batch_size", self.num_kv_heads // self.world_size, "past_sequence_length", self.head_size]))
             value_name = f"past_key_values.{i}.value"
-            inputs.append(helper.make_tensor_value_info(value_name, self.io_dtype, shape=["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size]))
+            inputs.append(helper.make_tensor_value_info(value_name, self.io_dtype, shape=["batch_size", self.num_kv_heads // self.world_size, "past_sequence_length", self.head_size]))
 
             # Add KV cache to outputs
             key_name = f"present.{i}.key"
-            outputs.append(helper.make_tensor_value_info(key_name, self.io_dtype, shape=["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size]))
+            outputs.append(helper.make_tensor_value_info(key_name, self.io_dtype, shape=["batch_size", self.num_kv_heads // self.world_size, "total_sequence_length", self.head_size]))
             value_name = f"present.{i}.value"
-            outputs.append(helper.make_tensor_value_info(value_name, self.io_dtype, shape=["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size]))
+            outputs.append(helper.make_tensor_value_info(value_name, self.io_dtype, shape=["batch_size", self.num_kv_heads // self.world_size, "total_sequence_length", self.head_size]))
 
         self.inputs = inputs
         self.outputs = outputs
@@ -499,7 +499,7 @@ class Model:
 
     def make_all_reduce(self, name, root_input):
         output = f"{name}/output_0"
-        self.make_node("AllReduce", inputs=[root_input], outputs=[output], name=name)
+        self.make_node("AllReduce", inputs=[root_input], outputs=[output], name=name, domain="com.microsoft")
         # self.make_value_info(output, dtype, shape=shape)
 
     def make_embedding(self, embedding):
@@ -598,7 +598,7 @@ class Model:
         inputs = [root_input, kwargs.pop("position_ids"), cos_cache_name, sin_cache_name]
         output = f"{name}/output_0"
         self.make_node("RotaryEmbedding", inputs=inputs, outputs=[output], name=name, domain="com.microsoft", interleaved=0, **kwargs)
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * (self.num_kv_heads if "k_rotary" in name else self.num_attn_heads)])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * (self.num_kv_heads // self.world_size if "k_rotary" in name else self.num_attn_heads // self.world_size)])
 
     # TODO: This function and any corresponding changes to support it are temporary until ORT supports GQA for CPU
     def make_repeat_kv(self, layer_id, root_input, past_kv, present_kv, **kwargs):
@@ -813,7 +813,7 @@ class Model:
             self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=int(self.num_attn_heads // self.world_size), kv_num_heads=int(self.num_kv_heads // self.world_size), local_window_size=self.window_size, scale=0.0883883461356163)
         else:
             self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, local_window_size=self.window_size)
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', int(self.head_size * self.num_attn_heads // self.world_size)])
 
     def make_attention(self, layer_id, attention, root_input, **kwargs):
         # Make nodes for the Attention subgraph
@@ -1001,6 +1001,21 @@ class Model:
         gate_name = f"/model/layers.{layer_id}/moe/gate/MatMul"
         self.make_matmul(bsm.gate.weight.detach().numpy(), gate_name, root_input)
 
+        shape_name = f"/model/layers.{layer_id}/moe/gate/Shape"
+        self.make_shape(shape_name, f"{gate_name}/output_0", shape=[3])
+
+        gather_name = f"/model/layers.{layer_id}/moe/gate/Gather"
+        self.make_gather(gather_name, [f"{shape_name}/output_0", "/model/constants/TensorProto.INT64/0D/2"], axis=0)
+
+        unsqueeze_name = f"/model/layers.{layer_id}/moe/gate/Unsqueeze"
+        self.make_unsqueeze(unsqueeze_name, [f"{gather_name}/output_0", "/model/constants/TensorProto.INT64/1D/0"], dtype=TensorProto.INT64, shape=[1])
+
+        concat_name = f"/model/layers.{layer_id}/moe/gate/Concat"
+        self.make_concat(concat_name, ["/model/constants/TensorProto.INT64/1D/-1", f"{unsqueeze_name}/output_0"], dtype=TensorProto.INT64, shape=[2], axis=0)
+
+        gate_reshape_name = f"/model/layers.{layer_id}/moe/gate/Reshape"
+        self.make_reshape(gate_reshape_name, [f"{gate_name}/output_0", f"{concat_name}/output_0"], dtype=self.io_dtype, shape=['num_rows', num_experts])
+
         moe_name = f"/model/layers.{layer_id}/moe"
         w1_list = []
         w2_list = []
@@ -1029,7 +1044,7 @@ class Model:
                     .transpose(0, 2, 1)[
                         :, :, self.rank * inter_size // self.world_size : (self.rank + 1) * inter_size // self.world_size
                     ]
-                    .transpose(0, 2, 1)
+                    .transpose(0, 2, 1).reshape(-1, hidden_size, inter_size // self.world_size)
                 )
 
             def get_fc2_tensor_shards(expert_weights):
@@ -1038,7 +1053,7 @@ class Model:
                     .transpose(0, 2, 1)[
                         :, self.rank * inter_size // self.world_size : (self.rank + 1) * inter_size // self.world_size, :
                     ]
-                    .transpose(0, 2, 1)
+                    .transpose(0, 2, 1).reshape(-1, inter_size // self.world_size, hidden_size)
                 )
 
             moe_experts_weight1 = get_fc1_tensor_shards(moe_experts_weight1)
@@ -1050,9 +1065,9 @@ class Model:
         self.make_external_tensor(moe_experts_weight3.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_3_name)
 
         bias_ph = "" # Placeholder for bias
-        inputs = [root_input, f"{gate_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
+        inputs = [root_input, f"{gate_reshape_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
         output = f"{moe_name}/output_0"
-        self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
+        self.make_node("ShardedMoE" if self.world_size > 1 else "MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
                         k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
