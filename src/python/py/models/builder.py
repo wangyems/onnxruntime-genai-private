@@ -810,7 +810,7 @@ class Model:
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
         if self.world_size > 1:
             # bugbug: scale is hardcoded to 0.0883883461356163
-            self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads / self.world_size, kv_num_heads=self.num_kv_heads / self.world_size, local_window_size=self.window_size, scale=0.0883883461356163)
+            self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=int(self.num_attn_heads // self.world_size), kv_num_heads=int(self.num_kv_heads // self.world_size), local_window_size=self.window_size, scale=0.0883883461356163)
         else:
             self.make_node("GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, local_window_size=self.window_size)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
@@ -857,30 +857,30 @@ class Model:
         # Make MatMul nodes
         q_matmul_name = f"/model/layers.{layer_id}/attn/q_proj/MatMul"
         if self.world_size > 1:
-            local_dim1 = attention.q_proj.weight.shape[1] // self.world_size
-            start = self.rank * local_dim1
-            end = start + local_dim1
-            self.make_matmul(attention.q_proj.weight.detach().numpy()[:, start : end], q_matmul_name, root_input)
+            local_dim = attention.q_proj.weight.shape[0] // self.world_size
+            start = self.rank * local_dim
+            end = start + local_dim
+            self.make_matmul(attention.q_proj.weight.detach().numpy()[start : end, :], q_matmul_name, root_input)
         else:
             self.make_matmul(attention.q_proj.weight.detach().numpy(), q_matmul_name, root_input)
         q_input_to_attention = f"{q_matmul_name}/output_0"
 
         k_matmul_name = f"/model/layers.{layer_id}/attn/k_proj/MatMul"
         if self.world_size > 1:
-            local_dim1 = attention.k_proj.weight.shape[1] // self.world_size
-            start = self.rank * local_dim1
-            end = start + local_dim1
-            self.make_matmul(attention.k_proj.weight.detach().numpy()[:, start : end], k_matmul_name, root_input)
+            local_dim = attention.k_proj.weight.shape[0] // self.world_size
+            start = self.rank * local_dim
+            end = start + local_dim
+            self.make_matmul(attention.k_proj.weight.detach().numpy()[start : end, :], k_matmul_name, root_input)
         else:
             self.make_matmul(attention.k_proj.weight.detach().numpy(), k_matmul_name, root_input)
         k_input_to_attention = f"{k_matmul_name}/output_0"
 
         v_matmul_name = f"/model/layers.{layer_id}/attn/v_proj/MatMul"
         if self.world_size > 1:
-            local_dim1 = attention.v_proj.weight.shape[1] // self.world_size
-            start = self.rank * local_dim1
-            end = start + local_dim1
-            self.make_matmul(attention.v_proj.weight.detach().numpy()[:, start : end], v_matmul_name, root_input)
+            local_dim = attention.v_proj.weight.shape[0] // self.world_size
+            start = self.rank * local_dim
+            end = start + local_dim
+            self.make_matmul(attention.v_proj.weight.detach().numpy()[start : end, :], v_matmul_name, root_input)
         else:
             self.make_matmul(attention.v_proj.weight.detach().numpy(), v_matmul_name, root_input)
         v_input_to_attention = f"{v_matmul_name}/output_0"
@@ -937,10 +937,10 @@ class Model:
         o_matmul_name = f"/model/layers.{layer_id}/attn/o_proj/MatMul"
         o_weight = eval(f"attention.{o_proj}.weight.detach().numpy()")
         if self.world_size > 1:
-            local_dim0 = o_weight.shape[0] // self.world_size
-            start = self.rank * local_dim0
-            end = start + local_dim0
-            self.make_matmul(o_weight[start : end, :], o_matmul_name, f"{attn_name}/output_0")
+            local_dim = o_weight.shape[1] // self.world_size
+            start = self.rank * local_dim
+            end = start + local_dim
+            self.make_matmul(o_weight[:, start : end], o_matmul_name, f"{attn_name}/output_0")
         else:
             self.make_matmul(o_weight, o_matmul_name, f"{attn_name}/output_0")
 
