@@ -1033,9 +1033,13 @@ class Model:
         moe_expert_2_name = f"model.layers.{layer_id}.moe.weight_2"
         moe_expert_3_name = f"model.layers.{layer_id}.moe.weight_3"
 
-        moe_experts_weight1 = torch.stack(w1_list, dim=0).detach().numpy()
-        moe_experts_weight2 = torch.stack(w2_list, dim=0).detach().numpy()
-        moe_experts_weight3 = torch.stack(w3_list, dim=0).detach().numpy()
+        moe_experts_weight1_full = torch.stack(w1_list, dim=0).detach().numpy()
+        moe_experts_weight2_full = torch.stack(w2_list, dim=0).detach().numpy()
+        moe_experts_weight3_full = torch.stack(w3_list, dim=0).detach().numpy()
+
+        moe_experts_weight1 = moe_experts_weight1_full
+        moe_experts_weight2 = moe_experts_weight2_full
+        moe_experts_weight3 = moe_experts_weight3_full
 
         if self.world_size > 1:
             def get_fc1_tensor_shards(expert_weights):
@@ -1056,9 +1060,9 @@ class Model:
                     .transpose(0, 2, 1).reshape(-1, inter_size // self.world_size, hidden_size)
                 )
 
-            moe_experts_weight1 = get_fc1_tensor_shards(moe_experts_weight1)
-            moe_experts_weight2 = get_fc2_tensor_shards(moe_experts_weight2)
-            moe_experts_weight3 = get_fc1_tensor_shards(moe_experts_weight3)
+            moe_experts_weight1 = get_fc1_tensor_shards(moe_experts_weight1_full)
+            moe_experts_weight2 = get_fc2_tensor_shards(moe_experts_weight2_full)
+            moe_experts_weight3 = get_fc1_tensor_shards(moe_experts_weight3_full)
 
         self.make_external_tensor(moe_experts_weight1.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_1_name)
         self.make_external_tensor(moe_experts_weight2.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_2_name)
@@ -1068,7 +1072,7 @@ class Model:
         inputs = [root_input, f"{gate_reshape_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
         output = f"{moe_name}/output_0"
         self.make_node("ShardedMoE" if self.world_size > 1 else "MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
-                        k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights)
+                        k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights, tensor_shards=self.world_size)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
         # Assign output 0 of previous MoE as root input to next SkipLayerNorm
