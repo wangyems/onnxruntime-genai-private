@@ -54,6 +54,8 @@ if __name__ == "__main__":
         for precision in ["int4", "fp32"]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 device = "cuda" if og.is_cuda_available() else "cpu"
+                print("Downloading model:", model_name, precision, device)
                 download_model(temp_dir, device, model_name, precision)
+                print("Running model:", model_name, precision, device)
                 run_model(temp_dir)
             
