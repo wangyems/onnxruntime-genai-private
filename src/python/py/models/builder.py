@@ -948,6 +948,11 @@ class Model:
         o_weight = eval(f"attention.{o_proj}.weight.detach().numpy()")
         self.make_matmul(self.make_shard(o_weight, sharding_axis=1), o_matmul_name, f"{attn_name}/output_0")
 
+        if self.world_size > 1:
+            all_reduce_name = f"/model/layers.{layer_id}/attn/o_proj/AllReduce"
+            self.make_all_reduce(all_reduce_name, f"{o_matmul_name}/output_0")
+            o_matmul_name = all_reduce_name
+
         # Make Add node (output projection bias node if bias exists)
         o_bias_exists = eval(f"attention.{o_proj}.bias") is not None
         if o_bias_exists:
@@ -956,12 +961,7 @@ class Model:
             self.make_add_bias(o_bias, o_add_name, root_input=f"{o_matmul_name}/output_0")
 
         # Assign output 0 of previous output node as skip input to next SkipLayerNorm
-        if self.world_size > 1:
-            all_reduce_name = f"/model/layers.{layer_id}/attn/o_proj/AllReduce"
-            self.make_all_reduce(all_reduce_name, f"{o_matmul_name}/output_0")
-            self.layernorm_attrs["skip_input"] = f"{all_reduce_name}/output_0"
-        else:
-            self.layernorm_attrs["skip_input"] = f"{o_matmul_name if not o_bias_exists else o_add_name}/output_0"
+        self.layernorm_attrs["skip_input"] = f"{o_matmul_name if not o_bias_exists else o_add_name}/output_0"
 
     def make_mlp(self, layer_id, mlp, root_input):
         # Make nodes for the MLP subgraph
@@ -1644,7 +1644,6 @@ class PhiModel(LlamaModel):
         #          FC2_MatMul
         #              |
         #           FC2_Add
-
         # Make first layer of fully connected nodes (FC1)
         fc1_matmul_name = f"/model/layers.{layer_id}/mlp/fc1/MatMul"
         self.make_matmul(self.make_shard(mlp.fc1.weight, sharding_axis=0), fc1_matmul_name, root_input)
@@ -1657,15 +1656,16 @@ class PhiModel(LlamaModel):
         # Make second layer of fully connected nodes (FC2)
         fc2_matmul_name = f"/model/layers.{layer_id}/mlp/fc2/MatMul"
         self.make_matmul(self.make_shard(mlp.fc2.weight, sharding_axis=1), fc2_matmul_name, root_input=f"{fast_gelu_name}/output_0")
+
+        if self.world_size > 1:
+            all_reduce_name = f"/model/layers.{layer_id}/mlp/all_reduce"
+            self.make_all_reduce(all_reduce_name, f"{fc2_matmul_name}/output_0")
+            fc2_matmul_name = all_reduce_name
+
         fc2_add_name = f"/model/layers.{layer_id}/mlp/fc2/Add"
         self.make_add_bias(mlp.fc2.bias.detach().numpy(), fc2_add_name, root_input=f"{fc2_matmul_name}/output_0")
 
-        if self.world_size == 1:
-            return fc2_add_name
-
-        all_reduce_name = f"/model/layers.{layer_id}/mlp/all_reduce"
-        self.make_all_reduce(all_reduce_name, f"{fc2_add_name}/output_0")
-        return all_reduce_name
+        return fc2_add_name
 
     def make_layer(self, layer_id, layer):
         # Each Phi decoder layer is defined as:
