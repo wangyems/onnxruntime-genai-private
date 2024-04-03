@@ -46,6 +46,7 @@ def run_model(model_path: str | bytes | os.PathLike):
 
     output_sequences = model.generate(params)
     output = tokenizer.decode_batch(output_sequences)
+    print(output)
     assert output
 
 
