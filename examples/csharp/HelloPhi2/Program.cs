@@ -42,7 +42,7 @@ while (true)
         while (!generator.IsDone())
         {
             generator.ComputeLogits();
-            generator.GenerateNextTokenTop();
+            generator.GenerateNextToken();
             Console.Write(tokenizerStream.Decode(generator.GetSequence(0)[^1]));
         }
     }
