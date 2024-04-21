@@ -53,6 +53,9 @@ class Model:
         self.filename = extra_options["filename"] if "filename" in extra_options else "model.onnx"
         self.extra_options = extra_options
 
+        self.world_size = int(extra_options["world_size"]) if "world_size" in extra_options else 1
+        self.rank = int(extra_options["rank"]) if "rank" in extra_options else 0
+
         self.inputs = []
         self.outputs = []
         self.initializers = []
@@ -74,8 +77,10 @@ class Model:
             "attention_mask": ["batch_size", "total_sequence_length"],                                           # For standard models
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
-            "past_key_values.key": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
-            "past_key_values.value": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],  # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
+            "past_key_values.key": 
+            ["batch_size", self.num_kv_heads // self.world_size, "past_sequence_length", self.head_size],        # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
+            "past_key_values.value": 
+            ["batch_size", self.num_kv_heads// self.world_size, "past_sequence_length", self.head_size],         # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
         if self.exclude_embeds:
@@ -92,8 +97,10 @@ class Model:
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
-            "present.key": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],           # For standard models (note that `present.key` is written this way to match Hugging Face format)
-            "present.value": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],         # For standard models (note that `present.value` is written this way to match Hugging Face format)
+            "present.key": 
+            ["batch_size", self.num_kv_heads // self.world_size, "total_sequence_length", self.head_size],       # For standard models (note that `present.key` is written this way to match Hugging Face format)
+            "present.value": 
+            ["batch_size", self.num_kv_heads // self.world_size, "total_sequence_length", self.head_size],       # For standard models (note that `present.value` is written this way to match Hugging Face format)
         }
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
@@ -189,6 +196,15 @@ class Model:
                 "block_size": int(extra_options["int4_block_size"]) if "int4_block_size" in extra_options else 32,
                 "accuracy_level": int(extra_options["int4_accuracy_level"]) if "int4_accuracy_level" in extra_options else None,
             }
+        }
+
+        # MoE-specific variables
+        num_experts = config.num_experts if hasattr(config, "num_experts") else 1
+        self.moe_attrs = {
+            "num_experts": num_experts,          # Number of experts in MoE layer
+            "top_k": 1,                          # Number of experts to select in MoE layer
+            "activation_type": "relu",           # Activation function for MoE layer
+            "normalize_routing_weights": False,  # Normalize routing weights in MoE layer
         }
 
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
@@ -386,6 +402,7 @@ class Model:
         for i in range(self.num_layers):
             # Add KV cache to inputs
             key_name = f"past_key_values.{i}.key"
+
             inputs.append(helper.make_tensor_value_info(key_name, self.input_types["past_key_values.key"], shape=self.input_shapes["past_key_values.key"]))
             value_name = f"past_key_values.{i}.value"
             inputs.append(helper.make_tensor_value_info(value_name, self.input_types["past_key_values.value"], shape=self.input_shapes["past_key_values.value"]))
@@ -399,6 +416,32 @@ class Model:
         self.inputs = inputs
         self.outputs = outputs
 
+    def make_shard(self, weight, sharding_axis=0):
+        # Shard 1D or 2D weights along specified axis.
+        if torch.is_tensor(weight):
+            weight = weight.detach().numpy()
+
+        if self.world_size == 1:
+            return weight
+        
+        assert len(weight.shape) == 1 or len(weight.shape) == 2, "Only 1D or 2D weights are supported"
+        if len(weight.shape) == 1:
+            assert sharding_axis == 0, "Sharding axis must be 0 for 1D weights"
+        if len(weight.shape) == 2:
+            assert sharding_axis == 0 or sharding_axis == 1, "Sharding axis must be 0 or 1 for 2D weights"
+
+        local_dim = weight.shape[sharding_axis] // self.world_size
+        idx_start = self.rank * local_dim
+        idx_end = idx_start + local_dim
+
+        if len(weight.shape) == 1:
+            return weight[idx_start : idx_end]
+
+        if sharding_axis == 0:
+            return weight[idx_start : idx_end, :]
+        
+        return weight[:, idx_start : idx_end]
+        
     def make_constant(self, name):
         # Make constant ops for 0, 1, 2, 3, etc.
         # Format of name is "/model/constants/{dtype}/{shape}/{num}"
@@ -564,6 +607,10 @@ class Model:
         else:
             self.make_add(name, add_bias_inputs, dtype=self.io_dtype, shape=shape)
 
+    def make_all_reduce(self, name, root_input):
+        output = f"{name}/output_0"
+        self.make_node("AllReduce", inputs=[root_input], outputs=[output], name=name, domain="com.microsoft")
+
     def make_packed_add(self, q_add, k_add, v_add, name, root_input, **kwargs):
         # Combine 3 Adds of shape H into 1 packed Add of shape 3H
         add = np.stack((q_add, k_add, v_add), axis=0).flatten()
@@ -666,8 +713,9 @@ class Model:
 
         inputs = [root_input, kwargs.pop("position_ids"), cos_cache_name, sin_cache_name]
         output = f"{name}/output_0"
+
         self.make_node("RotaryEmbedding", inputs=inputs, outputs=[output], name=name, domain="com.microsoft", interleaved=self.rotemb_attrs["interleaved"], **kwargs)
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * (self.num_kv_heads if "k_rotary" in name else self.num_attn_heads)])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * (self.num_kv_heads // self.world_size if "k_rotary" in name else self.num_attn_heads // self.world_size)])
 
     # TODO: This function and any corresponding changes to support it are temporary until ORT supports GQA for CPU
     def make_repeat_kv(self, layer_id, root_input, past_kv, present_kv, **kwargs):
@@ -868,8 +916,9 @@ class Model:
         ]
         output = f"{name}/output_0"
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
-        self.make_node("MultiHeadAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=self.num_attn_heads)
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
+        scale = 1 / np.sqrt(self.head_size)
+        self.make_node("MultiHeadAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft", num_heads=int(self.num_attn_heads // self.world_size), scale=scale)
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', int(self.head_size * self.num_attn_heads // self.world_size)])
 
     def make_group_query_attention(self, name, **kwargs):
         inputs = [
@@ -880,12 +929,14 @@ class Model:
         ]
         output = f"{name}/output_0"
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
+
+        scale = 1 / np.sqrt(self.head_size)
         self.make_node(
             "GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft",
-            num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, local_window_size=self.window_size,
-            do_rotary=self.attention_attrs["use_rotemb_in_attn"], rotary_interleaved=self.rotemb_attrs["interleaved"],
+            num_heads=self.num_attn_heads // self.world_size, kv_num_heads=self.num_kv_heads // self.world_size, local_window_size=self.window_size,
+            scale=scale, do_rotary=self.attention_attrs["use_rotemb_in_attn"], rotary_interleaved=self.rotemb_attrs["interleaved"],
         )
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads // self.world_size])
 
     def make_attention(self, layer_id, attention, root_input, **kwargs):
         # Make nodes for the Attention subgraph
@@ -930,17 +981,20 @@ class Model:
         if self.attention_attrs["use_packed_matmul"]:
             # Combine 3 MatMuls into 1 packed MatMul
             qkv_matmul_name = f"/model/layers.{layer_id}/attn/qkv_proj/MatMul"
-            self.make_packed_matmul(attention.q_proj.weight.detach().numpy(), attention.k_proj.weight.detach().numpy(), attention.v_proj.weight.detach().numpy(), qkv_matmul_name, root_input)
+            self.make_packed_matmul(self.make_shard(attention.q_proj.weight, sharding_axis=0), 
+                                    self.make_shard(attention.k_proj.weight, sharding_axis=0), 
+                                    self.make_shard(attention.v_proj.weight, sharding_axis=0), 
+                                    qkv_matmul_name, root_input)
             q_input_to_attention = f"{qkv_matmul_name}/output_0"
         else:
             q_matmul_name = f"/model/layers.{layer_id}/attn/q_proj/MatMul"
-            self.make_matmul(attention.q_proj.weight.detach().numpy(), q_matmul_name, root_input)
+            self.make_matmul(self.make_shard(attention.q_proj.weight, sharding_axis=0), q_matmul_name, root_input)
             q_input_to_attention = f"{q_matmul_name}/output_0"
             k_matmul_name = f"/model/layers.{layer_id}/attn/k_proj/MatMul"
-            self.make_matmul(attention.k_proj.weight.detach().numpy(), k_matmul_name, root_input)
+            self.make_matmul(self.make_shard(attention.k_proj.weight, sharding_axis=0), k_matmul_name, root_input)
             k_input_to_attention = f"{k_matmul_name}/output_0"
             v_matmul_name = f"/model/layers.{layer_id}/attn/v_proj/MatMul"
-            self.make_matmul(attention.v_proj.weight.detach().numpy(), v_matmul_name, root_input)
+            self.make_matmul(self.make_shard(attention.v_proj.weight, sharding_axis=0), v_matmul_name, root_input)
             v_input_to_attention = f"{v_matmul_name}/output_0"
 
         # Make Add nodes (if bias exists)
@@ -952,20 +1006,23 @@ class Model:
         if all_bias_exists and self.attention_attrs["use_packed_matmul"]:
             # Combine 3 Adds into 1 packed Add
             qkv_add_name = f"/model/layers.{layer_id}/attn/qkv_proj/Add"
-            self.make_packed_add(attention.q_proj.bias.detach().numpy(), attention.k_proj.bias.detach().numpy(), attention.v_proj.bias.detach().numpy(), qkv_add_name, root_input=q_input_to_attention)
+            self.make_packed_add(self.make_shard(attention.q_proj.bias), 
+                                 self.make_shard(attention.k_proj.bias), 
+                                 self.make_shard(attention.v_proj.bias), 
+                                 qkv_add_name, root_input=q_input_to_attention)
             q_input_to_attention = f"{qkv_add_name}/output_0"
         else:
             if q_bias_exists:
                 q_add_name = f"/model/layers.{layer_id}/attn/q_proj/Add"
-                self.make_add_bias(attention.q_proj.bias.detach().numpy(), q_add_name, root_input=q_input_to_attention)
+                self.make_add_bias(self.make_shard(attention.q_proj.bias), q_add_name, root_input=f"{q_matmul_name}/output_0")
                 q_input_to_attention = f"{q_add_name}/output_0"
             if k_bias_exists:
                 k_add_name = f"/model/layers.{layer_id}/attn/k_proj/Add"
-                self.make_add_bias(attention.k_proj.bias.detach().numpy(), k_add_name, root_input=k_input_to_attention)
+                self.make_add_bias(self.make_shard(attention.k_proj.bias), k_add_name, root_input=f"{k_matmul_name}/output_0")
                 k_input_to_attention = f"{k_add_name}/output_0"
             if v_bias_exists:
                 v_add_name = f"/model/layers.{layer_id}/attn/v_proj/Add"
-                self.make_add_bias(attention.v_proj.bias.detach().numpy(), v_add_name, root_input=v_input_to_attention)
+                self.make_add_bias(self.make_shard(attention.v_proj.bias), v_add_name, root_input=f"{v_matmul_name}/output_0")
                 v_input_to_attention = f"{v_add_name}/output_0"
 
         # Make RotaryEmbedding nodes
@@ -1002,7 +1059,12 @@ class Model:
         o_proj = 'o_proj' if hasattr(attention, 'o_proj') else 'dense'
         o_matmul_name = f"/model/layers.{layer_id}/attn/o_proj/MatMul"
         o_weight = eval(f"attention.{o_proj}.weight.detach().numpy()")
-        self.make_matmul(o_weight, o_matmul_name, f"{attn_name}/output_0")
+        self.make_matmul(self.make_shard(o_weight, sharding_axis=1), o_matmul_name, f"{attn_name}/output_0")
+
+        if self.world_size > 1:
+            all_reduce_name = f"/model/layers.{layer_id}/attn/o_proj/AllReduce"
+            self.make_all_reduce(all_reduce_name, f"{o_matmul_name}/output_0")
+            o_matmul_name = all_reduce_name
 
         # Make Add node (output projection bias node if bias exists)
         o_bias_exists = eval(f"attention.{o_proj}.bias") is not None
@@ -1034,12 +1096,14 @@ class Model:
         #             Mul
         #              |
         #        DownProjMatMul
+        if mlp is None:
+            return
 
         # Make MatMul nodes
         gate_name = f"/model/layers.{layer_id}/mlp/gate_proj/MatMul"
-        self.make_matmul(mlp.gate_proj.weight.detach().numpy(), gate_name, root_input)
+        self.make_matmul(self.make_shard(mlp.gate_proj.weight, sharding_axis=0), gate_name, root_input)
         up_name = f"/model/layers.{layer_id}/mlp/up_proj/MatMul"
-        self.make_matmul(mlp.up_proj.weight.detach().numpy(), up_name, root_input)
+        self.make_matmul(self.make_shard(mlp.up_proj.weight, sharding_axis=0), up_name, root_input)
 
         # Make activation node(s)
         act_fn_name = self.make_activation(layer_id, root_input=f"{gate_name}/output_0")
@@ -1047,14 +1111,19 @@ class Model:
         # Make Mul node after activation
         mul_name = f"/model/layers.{layer_id}/mlp/Mul"
         mul_inputs = [f"{act_fn_name}/output_0", f"{up_name}/output_0"]
-        self.make_mul(mul_name, mul_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
+        self.make_mul(mul_name, mul_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size // self.world_size])
 
         # Make output MatMul node
         down_name = f"/model/layers.{layer_id}/mlp/down_proj/MatMul"
-        self.make_matmul(mlp.down_proj.weight.detach().numpy(), down_name, f"{mul_name}/output_0")
+        self.make_matmul(self.make_shard(mlp.down_proj.weight, sharding_axis=1), down_name, f"{mul_name}/output_0")
 
         # Assign output 0 of previous MatMul as skip input to next SkipLayerNorm
-        self.layernorm_attrs["skip_input"] = f"{down_name}/output_0"
+        if self.world_size > 1:
+            all_reduce_name = f"/model/layers.{layer_id}/mlp/AllReduce"
+            self.make_all_reduce(all_reduce_name, f"{down_name}/output_0")
+            self.layernorm_attrs["skip_input"] = f"{all_reduce_name}/output_0"
+        else:
+            self.layernorm_attrs["skip_input"] = f"{down_name}/output_0"
 
     def make_mlp_fc(self, layer_id, mlp, root_input):
         # Make nodes for the MLP subgraph
@@ -1070,24 +1139,126 @@ class Model:
         #          FC2_MatMul
         #              |
         #           FC2_Add
-
         # Make first layer of fully connected nodes (FC1)
+        if mlp is None:
+            return
+        
         fc1_matmul_name = f"/model/layers.{layer_id}/mlp/fc1/MatMul"
-        self.make_matmul(mlp.fc1.weight.detach().numpy(), fc1_matmul_name, root_input)
+        self.make_matmul(self.make_shard(mlp.fc1.weight, sharding_axis=0), fc1_matmul_name, root_input)
         fc1_add_name = f"/model/layers.{layer_id}/mlp/fc1/Add"
-        self.make_add_bias(mlp.fc1.bias.detach().numpy(), fc1_add_name, root_input=f"{fc1_matmul_name}/output_0")
+        self.make_add_bias(self.make_shard(mlp.fc1.bias), fc1_add_name, root_input=f"{fc1_matmul_name}/output_0")
 
         # Make activation function
         act_fn_name = self.make_activation(layer_id, root_input=f"{fc1_add_name}/output_0")
 
         # Make second layer of fully connected nodes (FC2)
         fc2_matmul_name = f"/model/layers.{layer_id}/mlp/fc2/MatMul"
-        self.make_matmul(mlp.fc2.weight.detach().numpy(), fc2_matmul_name, root_input=f"{act_fn_name}/output_0")
+        self.make_matmul(self.make_shard(mlp.fc2.weight, sharding_axis=1), fc2_matmul_name, root_input=f"{act_fn_name}/output_0")
+
+        if self.world_size > 1:
+            all_reduce_name = f"/model/layers.{layer_id}/mlp/all_reduce"
+            self.make_all_reduce(all_reduce_name, f"{fc2_matmul_name}/output_0")
+            fc2_matmul_name = all_reduce_name
+
         fc2_add_name = f"/model/layers.{layer_id}/mlp/fc2/Add"
         self.make_add_bias(mlp.fc2.bias.detach().numpy(), fc2_add_name, root_input=f"{fc2_matmul_name}/output_0")
 
         # Assign output 0 of MLP layer as output of last layer
         self.mlp_attrs["output_0"] = f"{fc2_add_name}/output_0"
+
+    def make_block_sparse_moe(self, layer_id, bsm, root_input):
+        if bsm is None:
+            return
+
+        num_experts = self.moe_attrs["num_experts"]
+        top_k = self.moe_attrs["top_k"]
+        activation_type = self.moe_attrs["activation_type"]
+        normalize_routing_weights = self.moe_attrs["normalize_routing_weights"]
+        
+        # Make MoE nodes
+        gate_name = f"/model/layers.{layer_id}/moe/gate/MatMul"
+        self.make_matmul(bsm.gate.weight.detach().numpy(), gate_name, root_input)
+
+        shape_name = f"/model/layers.{layer_id}/moe/gate/Shape"
+        self.make_shape(shape_name, f"{gate_name}/output_0", shape=[3])
+
+        gather_name = f"/model/layers.{layer_id}/moe/gate/Gather"
+        self.make_gather(gather_name, [f"{shape_name}/output_0", "/model/constants/TensorProto.INT64/0D/2"], axis=0)
+
+        unsqueeze_name = f"/model/layers.{layer_id}/moe/gate/Unsqueeze"
+        self.make_unsqueeze(unsqueeze_name, [f"{gather_name}/output_0", "/model/constants/TensorProto.INT64/1D/0"], dtype=TensorProto.INT64, shape=[1])
+
+        concat_name = f"/model/layers.{layer_id}/moe/gate/Concat"
+        self.make_concat(concat_name, ["/model/constants/TensorProto.INT64/1D/-1", f"{unsqueeze_name}/output_0"], dtype=TensorProto.INT64, shape=[2], axis=0)
+
+        gate_reshape_name = f"/model/layers.{layer_id}/moe/gate/Reshape"
+        self.make_reshape(gate_reshape_name, [f"{gate_name}/output_0", f"{concat_name}/output_0"], dtype=self.io_dtype, shape=['num_rows', num_experts])
+
+        moe_name = f"/model/layers.{layer_id}/moe"
+        w1_list = []
+        w2_list = []
+        w3_list = []
+
+        hidden_size = self.hidden_size
+        inter_size = self.intermediate_size
+
+        for i in range(num_experts):
+            w1_list.append(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)))
+            w2_list.append(torch.reshape(bsm.experts[i].w2.weight, (inter_size, hidden_size)))
+            w3_list.append(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)))
+
+        moe_expert_1_name = f"model.layers.{layer_id}.moe.weight_1"
+        moe_expert_2_name = f"model.layers.{layer_id}.moe.weight_2"
+        moe_expert_3_name = f"model.layers.{layer_id}.moe.weight_3"
+
+        moe_experts_weight1_full = torch.stack(w1_list, dim=0).detach().numpy()
+        moe_experts_weight2_full = torch.stack(w2_list, dim=0).detach().numpy()
+        moe_experts_weight3_full = torch.stack(w3_list, dim=0).detach().numpy()
+
+        moe_experts_weight1 = moe_experts_weight1_full
+        moe_experts_weight2 = moe_experts_weight2_full
+        moe_experts_weight3 = moe_experts_weight3_full
+
+        if self.world_size > 1:
+            def get_fc1_tensor_shards(expert_weights):
+                return (
+                    expert_weights.reshape(-1, inter_size, hidden_size)
+                    .transpose(0, 2, 1)[
+                        :, :, self.rank * inter_size // self.world_size : (self.rank + 1) * inter_size // self.world_size
+                    ]
+                    .transpose(0, 2, 1).reshape(-1, hidden_size, inter_size // self.world_size)
+                )
+
+            def get_fc2_tensor_shards(expert_weights):
+                return (
+                    expert_weights.reshape(-1, hidden_size, inter_size)
+                    .transpose(0, 2, 1)[
+                        :, self.rank * inter_size // self.world_size : (self.rank + 1) * inter_size // self.world_size, :
+                    ]
+                    .transpose(0, 2, 1).reshape(-1, inter_size // self.world_size, hidden_size)
+                )
+
+            moe_experts_weight1 = get_fc1_tensor_shards(moe_experts_weight1_full)
+            moe_experts_weight2 = get_fc2_tensor_shards(moe_experts_weight2_full)
+            moe_experts_weight3 = get_fc1_tensor_shards(moe_experts_weight3_full)
+
+        self.make_external_tensor(moe_experts_weight1.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_1_name)
+        self.make_external_tensor(moe_experts_weight2.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_2_name)
+        self.make_external_tensor(moe_experts_weight3.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_3_name)
+
+        bias_ph = "" # Placeholder for bias
+        inputs = [root_input, f"{gate_reshape_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
+        output = f"{moe_name}/output_0"
+        if self.world_size > 1:        
+            self.make_node("ShardedMoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
+                            k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights, tensor_shards=self.world_size)
+        else:
+            self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
+                            k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights)
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+
+        # Assign output 0 of previous MoE as root input to next SkipLayerNorm
+        self.layernorm_attrs["skip_input"] = output
 
     def make_activation_with_mul(self, layer_id, root_input, activation, domain):
         # Make nodes for this activation subgraph
@@ -1100,11 +1271,11 @@ class Model:
         act_name = f"/model/layers.{layer_id}/mlp/act_fn/{activation}"
         act_output = f"{act_name}/output_0"
         self.make_node(activation, inputs=[root_input], outputs=[act_output], name=act_name, domain=domain)
-        self.make_value_info(act_output, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
+        self.make_value_info(act_output, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size // self.world_size])
 
         mul_act_name = f"/model/layers.{layer_id}/mlp/act_fn/Mul"
         mul_act_inputs = [root_input, act_output]
-        self.make_mul(mul_act_name, mul_act_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
+        self.make_mul(mul_act_name, mul_act_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size // self.world_size])
 
         return mul_act_name
 
@@ -1117,7 +1288,7 @@ class Model:
         gelu_name = f"/model/layers.{layer_id}/mlp/act_fn/{activation}"
         output = f"{gelu_name}/output_0"
         self.make_node(activation, inputs=[root_input], outputs=[output], name=gelu_name, domain="com.microsoft")
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.intermediate_size])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.intermediate_size // self.world_size])
 
         return gelu_name
 
@@ -1138,6 +1309,9 @@ class Model:
         root_input = self.layernorm_attrs["output_0"]
         self.make_matmul(lm_head.weight.detach().numpy(), matmul_name, root_input, logits=not bias_exists)
 
+        # We should do make_shard(lm_head.weight, sharding_axis=0) here, but given that it has minor impact on performance
+        # and requires changes in generation, leave it to the next PR.
+
         if bias_exists:
             add_name = "/lm_head/Add"
             self.make_add_bias(lm_head.bias.detach().numpy(), add_name, root_input=f"{matmul_name}/output_0", logits=True)
@@ -1148,7 +1322,10 @@ class Model:
         self.make_layernorm(layer_id, layer.input_layernorm, skip=not self.layernorm_attrs["first_layernorm"], simple=self.layernorm_attrs["simple"], location="input")
         self.make_attention(layer_id, layer.self_attn, self.layernorm_attrs["output_0"])
         self.make_layernorm(layer_id, layer.post_attention_layernorm, skip=True, simple=self.layernorm_attrs["simple"], location="post_attention")
-        self.make_mlp(layer_id, layer.mlp, self.layernorm_attrs["output_0"])
+        if hasattr(layer, "mlp"):
+            self.make_mlp(layer_id, layer.mlp, self.layernorm_attrs["output_0"])
+        if hasattr(layer, "block_sparse_moe"):
+            self.make_block_sparse_moe(layer_id, layer.block_sparse_moe, self.layernorm_attrs["output_0"])
 
         self.layernorm_attrs["first_layernorm"] = False
         if layer_id == self.num_layers - 1:
@@ -1669,6 +1846,14 @@ class GemmaModel(MistralModel):
         self.embed_attrs["normalize"] = True
         self.layernorm_attrs["add_offset"] = 1
 
+class MixtralModel(MistralModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.moe_attrs["num_experts"] = 8
+        self.moe_attrs["top_k"] = 2
+        self.moe_attrs["activation_type"] = "silu"
+        self.moe_attrs["normalize_routing_weights"] = 1
+
 
 def parse_extra_options(kv_items):
     """
@@ -1708,6 +1893,8 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model = MistralModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "PhiForCausalLM":
             onnx_model = PhiModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "MixtralForCausalLM":
+            onnx_model = MixtralModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         else:
             raise NotImplementedError(f"The {hf_name} model is not currently supported.")
 
@@ -1800,6 +1987,8 @@ def get_args():
                     The filename for each component will be '<filename>_<component-name>.onnx' (ex: '<filename>_encoder.onnx', '<filename>_decoder.onnx').
                 config_only = Generate config and pre/post processing files only.
                     Use this option when you already have your optimized and/or quantized ONNX model.
+                world_size = Number of GPUs to use for distributed inference. Default is 1.
+                rank = Rank of current GPU in distributed inference. Must be less than world_size. Default is 0.
                 exclude_embeds = Remove embedding layer from your ONNX model.
                     Use this option when you want to remove the embedding layer from within your ONNX model.
                     Instead of `input_ids`, you will have `inputs_embeds` as the input to your ONNX model.
