@@ -15,7 +15,7 @@ def main(args):
     if args.verbose: print("Tokenizer created")
     if args.verbose: print()
     search_options = {name:getattr(args, name) for name in ['do_sample', 'max_length', 'min_length', 'top_p', 'top_k', 'temperature', 'repetition_penalty'] if name in args}
-    
+
     # Set the max length to something sensible by default, unless it is specified by the user,
     # since otherwise it will be set to the entire context length
     if 'max_length' not in search_options:
@@ -38,7 +38,8 @@ def main(args):
         input_tokens = tokenizer.encode(prompt)
 
         params = og.GeneratorParams(model)
-        params.try_use_cuda_graph_with_max_batch_size(1)
+        if args.batch_size_for_cuda_graph:
+            params.try_use_cuda_graph_with_max_batch_size(args.batch_size_for_cuda_graph)
         params.set_search_options(**search_options)
         params.input_ids = input_tokens
         generator = og.Generator(model, params)
@@ -85,6 +86,7 @@ if __name__ == "__main__":
     parser.add_argument('-k', '--top_k', type=int, help='Top k tokens to sample from')
     parser.add_argument('-t', '--temperature', type=float, help='Temperature to sample with')
     parser.add_argument('-r', '--repetition_penalty', type=float, help='Repetition penalty to sample with')
+    parser.add_argument('-b', '--batch_size_for_cuda_graph', type=int, default=1, help='Max batch size for CUDA/DML graph')
     parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Print verbose output and timing information. Defaults to false')
     parser.add_argument('-g', '--timings', action='store_true', default=False, help='Print timing information for each generation step. Defaults to false')
     args = parser.parse_args()

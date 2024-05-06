@@ -18,7 +18,7 @@ def main(args):
     search_options = {name:getattr(args, name) for name in ['do_sample', 'max_length', 'min_length', 'top_p', 'top_k', 'temperature', 'repetition_penalty'] if name in args}
 
     if args.verbose: print(search_options)
-    
+
     if args.chat_template:
         if args.chat_template.count('{') != 1 or args.chat_template.count('}') != 1:
             print("Error, chat template must have exactly one pair of curly braces, e.g. '<|user|>\n{input} <|end|>\n<|assistant|>'")
@@ -41,7 +41,8 @@ def main(args):
         input_tokens = tokenizer.encode(prompt)
 
         params = og.GeneratorParams(model)
-        params.try_use_cuda_graph_with_max_batch_size(1)
+        if args.batch_size_for_cuda_graph:
+            params.try_use_cuda_graph_with_max_batch_size(args.batch_size_for_cuda_graph)
         params.set_search_options(**search_options)
         params.input_ids = input_tokens
         generator = og.Generator(model, params)
@@ -90,6 +91,7 @@ if __name__ == "__main__":
     parser.add_argument('-r', '--repetition_penalty', type=float, help='Repetition penalty to sample with')
     parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Print verbose output and timing information. Defaults to false')
     parser.add_argument('-g', '--timings', action='store_true', default=False, help='Print timing information for each generation step. Defaults to false')
+    parser.add_argument('-b', '--batch_size_for_cuda_graph', type=int, default=1, help='Max batch size for CUDA/DML graph')
     parser.add_argument('-c', '--chat_template', type=str, default='', help='Chat template to use for the prompt. User input will be injected into {input}')
     args = parser.parse_args()
     main(args)

@@ -15,26 +15,24 @@ def main(args):
         prompts = ["I like walking my cute dog",
                    "What is the best restaurant in town?",
                    "Hello, how are you today?"]
-    
+
     if args.chat_template:
         if args.chat_template.count('{') != 1 or args.chat_template.count('}') != 1:
             print("Error, chat template must have exactly one pair of curly braces, e.g. '<|user|>\n{input} <|end|>\n<|assistant|>'")
             exit(1)
         prompts[:] = [f'{args.chat_template.format(input=text)}' for text in prompts]
-        
+
     input_tokens = tokenizer.encode_batch(prompts)
     if args.verbose: print(f'Prompt(s) encoded: {prompts}')
 
     params = og.GeneratorParams(model)
 
-    search_options = {name:getattr(args, name) for name in ['do_sample', 'max_length', 'min_length', 'top_p', 'top_k', 'temperature', 'repetition_penalty'] if name in args} 
+    search_options = {name:getattr(args, name) for name in ['do_sample', 'max_length', 'min_length', 'top_p', 'top_k', 'temperature', 'repetition_penalty'] if name in args}
 
     if (args.verbose): print(f'Args: {args}')
     if (args.verbose): print(f'Search options: {search_options}')
 
     params.set_search_options(**search_options)
-    # Set the batch size for the CUDA graph to the number of prompts if the user didn't specify a batch size
-    params.try_use_cuda_graph_with_max_batch_size(len(prompts))
     if args.batch_size_for_cuda_graph:
         params.try_use_cuda_graph_with_max_batch_size(args.batch_size_for_cuda_graph)
     params.input_ids = input_tokens
@@ -68,7 +66,7 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--temperature', type=float, help='Temperature to sample with')
     parser.add_argument('-r', '--repetition_penalty', type=float, help='Repetition penalty to sample with')
     parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Print verbose output and timing information. Defaults to false')
-    parser.add_argument('-b', '--batch_size_for_cuda_graph', type=int, default=1, help='Max batch size for CUDA graph')
+    parser.add_argument('-b', '--batch_size_for_cuda_graph', type=int, default=1, help='Max batch size for CUDA/DML graph')
     parser.add_argument('-c', '--chat_template', type=str, default='', help='Chat template to use for the prompt. User input will be injected into {input}. If not set, the prompt is used as is.')
 
     args = parser.parse_args()
