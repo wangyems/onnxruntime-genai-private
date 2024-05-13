@@ -343,7 +343,7 @@ void Model::CreateSessionOptions() {
     } else if (provider_options.name == "dml") {
       dml_objects_ = DmlHelpers::CreateDmlObjects();
 
-      auto directml_dll = L"DirectML.dll";
+      std::wstring directml_dll = L"DirectML.dll";
       wil::unique_hmodule smart_directml_dll(LoadLibraryExW(directml_dll.c_str(), nullptr, 0));
       THROW_LAST_ERROR_IF(!smart_directml_dll);
 
