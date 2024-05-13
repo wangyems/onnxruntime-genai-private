@@ -343,13 +343,9 @@ void Model::CreateSessionOptions() {
     } else if (provider_options.name == "dml") {
       dml_objects_ = DmlHelpers::CreateDmlObjects();
 
-      auto directml_dll = CurrentModulePath() + L"DirectML.dll";
+      auto directml_dll = L"DirectML.dll";
       wil::unique_hmodule smart_directml_dll(LoadLibraryExW(directml_dll.c_str(), nullptr, 0));
       THROW_LAST_ERROR_IF(!smart_directml_dll);
-
-      if (LoadLibraryExW(directml_dll.c_str(), nullptr, 0) == NULL) {
-        throw std::runtime_error("DirectML.dll not found");
-      }
 
       auto dml_create_device1_fn = reinterpret_cast<decltype(&DMLCreateDevice1)>(GetProcAddress(smart_directml_dll.get(), "DMLCreateDevice1"));
       THROW_LAST_ERROR_IF(!dml_create_device1_fn);
