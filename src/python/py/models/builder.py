@@ -7,7 +7,8 @@
 Run this script to create the desired ONNX model.
 """
 
-from onnx import helper, numpy_helper, TensorProto, external_data_helper, save_model
+from typing import Sequence
+from onnx import numpy_helper, TensorProto, external_data_helper, save_model
 from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import numpy as np
@@ -18,6 +19,19 @@ import gc
 import json
 import os
 import textwrap
+from onnxscript import ir
+from onnxscript.ir import _convenience as ir_convenience
+
+
+def make_value(name, dtype: int | None=None, shape=None) -> ir.Value:
+    if shape is not None:
+        shape = ir.Shape(shape)
+    if dtype is not None:
+        type_ = ir.TensorType(ir.DataType(dtype))
+    else:
+        type_ = None
+
+    return ir.Value(None, index=None, name=name, type=type_, shape=shape)
 
 
 class Model:
@@ -42,11 +56,11 @@ class Model:
         self.filename = extra_options["filename"] if "filename" in extra_options else "model.onnx"
         self.extra_options = extra_options
 
-        self.inputs = []
-        self.outputs = []
-        self.initializers = []
-        self.value_infos = []
-        self.nodes = []
+        self.values: dict[str, ir.Value] = {}
+        self.nodes: dict[str, ir.Node] = {}
+        self.graph = ir.Graph(
+            [], [], nodes=[], opset_imports={"": 14, "com.microsoft": 1}
+        )
 
         # EP-specific variables
         enable_cuda_graph = "1" if "enable_cuda_graph" in extra_options and extra_options["enable_cuda_graph"] == "1" else "0"
@@ -99,9 +113,6 @@ class Model:
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
             self.output_names = [name.replace("logits", "hidden_states") for name in self.output_names]
-
-        # Store names of nodes already created
-        self.node_names = set()
 
         # Map TensorProto dtypes to NumPy dtypes
         self.to_numpy_dtype = {
@@ -278,20 +289,14 @@ class Model:
         gc.collect()
 
         # Create ONNX model
-        model = helper.make_model(
-            opset_imports=[self.clear_field(helper.make_operatorsetid('', 14), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
+        ir_model = ir.Model(
+            self.graph,
             ir_version=7,
             producer_name="onnxruntime-genai",
             producer_version="0.0.0",
-            graph=self.make_graph(
-                name="main_graph",
-                inputs=self.inputs,
-                outputs=self.outputs,
-                initializer=self.initializers,
-                value_info=self.value_infos,
-                nodes=self.nodes,
-            )
         )
+
+        model = ir.serde.serialize_model(ir_model)
 
         # Load external data into ONNX model
         external_data_helper.load_external_data_for_model(model, self.cache_dir)
@@ -341,41 +346,80 @@ class Model:
         quant.process()
         return quant.model.model
 
-    def clear_field(self, proto, field):
-        proto.ClearField(field)
-        return proto
-
-    def order_repeated_field(self, repeated_proto, key_name, order):
-        order = list(order)
-        repeated_proto.sort(key=lambda x: order.index(getattr(x, key_name)))
-
     def make_external_tensor(self, np_data, name, **kwargs):
         tensor = numpy_helper.from_array(np_data)
         tensor.name = name
 
         filename = f"{name}.bin"
         external_data_helper.set_external_data(tensor, location=filename)
-        with open(os.path.join(self.cache_dir, filename), "wb") as f:
+        path = os.path.join(self.cache_dir, filename)
+        with open(path, "wb") as f:
             f.write(tensor.raw_data)
         tensor.ClearField("raw_data")
         tensor.data_location = TensorProto.EXTERNAL
 
-        self.initializers.append(tensor)
+        external_tensor = ir.serde.deserialize_tensor(tensor)
+        self.graph.initializers[name] = external_tensor
+        self.values[name] = make_value(name, external_tensor.dtype, external_tensor.shape)
 
-    def make_node(self, op_type, inputs, outputs, name=None, doc_string=None, domain=None, **kwargs):
+    def input_names_to_values(self, names: Sequence[str]) -> Sequence[ir.Value | None]:
+        values = []
+        for name in names:
+            if name:
+                if name in self.values:
+                    values.append(self.values[name])
+                else:
+                    new_value = make_value(name)
+                    self.values[name] = new_value
+                    values.append(new_value)
+            else:
+                values.append(None)
+        return values
+
+    def output_names_to_values(self, names: Sequence[str | None]) -> Sequence[ir.Value]:
+        values = []
+        for name in names:
+            if name:
+                if name in self.values:
+                    values.append(self.values[name])
+                    break
+            # output value cannot be done
+            if name is None:
+                name = ""
+            new_value = make_value(name)
+            if name:
+                # Only register the value if it has a name, otherwise it is an empty output
+                self.values[name] = new_value
+            values.append(new_value)
+        return values
+
+    def make_node_subgraph(self, op_type: str, inputs: Sequence[ir.Value], outputs: Sequence[ir.Value], name: str | None=None, doc_string=None, domain="", **kwargs) -> ir.Node:
+        node = ir.Node(domain, op_type, inputs, attributes=ir_convenience.convert_attributes(kwargs), outputs=outputs, name=name, doc_string=doc_string)
+        return node
+
+    def make_node(self, op_type: str, inputs: Sequence[str], outputs: Sequence[str | None], name: str | None=None, doc_string=None, domain="", **kwargs):
         # Save any constants as nodes
         for input_name in inputs:
-            if input_name.startswith("/model/constants") and input_name not in self.node_names:
+            if input_name.startswith("/model/constants") and input_name not in self.values:
                 self.make_constant(input_name)
 
         # Make node only if it does not already exist
-        if name not in self.node_names:
-            node = helper.make_node(op_type, inputs, outputs, name, doc_string, domain, **kwargs)
-            if doc_string == '':
-                node.doc_string = ''
-            self.order_repeated_field(node.attribute, 'name', kwargs.keys())
-            self.nodes.append(node)
-            self.node_names.add(name)
+        if name not in self.nodes:
+            input_values = self.input_names_to_values(inputs)
+            output_values = self.output_names_to_values(outputs)
+            node = ir.Node(
+                domain,
+                op_type,
+                input_values,
+                attributes=ir_convenience.convert_attributes(kwargs),
+                outputs=output_values,
+                name=name,
+                doc_string=doc_string,
+            )
+
+            if name is not None:
+                self.nodes[name] = node
+            self.graph.append(node)
 
         # Note:
         #
@@ -388,46 +432,42 @@ class Model:
         # needs to be added into the graph or not.
 
     def make_value_info(self, name, dtype, shape):
-        value_info = helper.make_tensor_value_info(name, dtype, shape=shape)
-        self.value_infos.append(value_info)
-
-    def make_graph(self, *args, doc_string=None, **kwargs):
-        graph = helper.make_graph(*args, doc_string=doc_string, **kwargs)
-        if doc_string == '':
-            graph.doc_string = ''
-        return graph
+        value = self.values[name]
+        value.dtype = ir.DataType(dtype)
+        if shape is not None:
+            value.shape = ir.Shape(shape)
 
     def make_inputs_and_outputs(self):
         # Add model-specific inputs to list of model inputs
-        inputs = []
         for name in self.input_names:
             dtype = self.input_types[name]
             shape = self.input_shapes[name]
-            inputs.append(helper.make_tensor_value_info(name, dtype, shape=shape))
+            self.values[name] = make_value(name, dtype, shape=shape)
+            self.graph.inputs.append(self.values[name])
 
         # Add model-specific outputs to list of model outputs
-        outputs = []
         for name in self.output_names:
             dtype = self.output_types[name]
             shape = self.output_shapes[name]
-            outputs.append(helper.make_tensor_value_info(name, dtype, shape=shape))
+            self.values[name] = make_value(name, dtype, shape=shape)
+            self.graph.outputs.append(self.values[name])
 
-        # Add KV cache to inputs and outputs
         for i in range(self.num_layers):
             # Add KV cache to inputs
             key_name = f"past_key_values.{i}.key"
-            inputs.append(helper.make_tensor_value_info(key_name, self.input_types["past_key_values.key"], shape=self.input_shapes["past_key_values.key"]))
+            self.values[key_name] = make_value(key_name, self.input_types["past_key_values.key"], shape=self.input_shapes["past_key_values.key"])
+            self.graph.inputs.append(self.values[key_name])
             value_name = f"past_key_values.{i}.value"
-            inputs.append(helper.make_tensor_value_info(value_name, self.input_types["past_key_values.value"], shape=self.input_shapes["past_key_values.value"]))
+            self.values[value_name] = make_value(value_name, self.input_types["past_key_values.value"], shape=self.input_shapes["past_key_values.value"])
+            self.graph.inputs.append(self.values[value_name])
 
             # Add KV cache to outputs
             key_name = f"present.{i}.key"
-            outputs.append(helper.make_tensor_value_info(key_name, self.output_types["present.key"], shape=self.output_shapes["present.key"]))
+            self.values[key_name] = make_value(key_name, self.output_types["present.key"], self.output_shapes["present.key"])
+            self.graph.outputs.append(self.values[key_name])
             value_name = f"present.{i}.value"
-            outputs.append(helper.make_tensor_value_info(value_name, self.output_types["present.value"], shape=self.output_shapes["present.value"]))
-
-        self.inputs = inputs
-        self.outputs = outputs
+            self.values[value_name] = make_value(value_name, self.output_types["present.value"], self.output_shapes["present.value"])
+            self.graph.outputs.append(self.values[value_name])
 
     def make_constant(self, name):
         # Make constant ops for 0, 1, 2, 3, etc.
@@ -440,7 +480,6 @@ class Model:
         node_name = name.replace("constants", "constant_nodes")
         self.make_node("Constant", inputs=[], outputs=[name], name=node_name, value=value)
         self.make_value_info(name, onnx_dtype, shape=[])
-        self.node_names.add(name)
 
     def make_gather(self, name, inputs, axis):
         output = f"{name}/output_0"
@@ -1578,7 +1617,6 @@ class Model:
 
         return expand_name
 
-
     def make_attention_mask_reformatting_for_gqa(self):
         # Make nodes for the attention mask subgraph that calculates
         # attributes about the 2D attention mask to use in GroupQueryAttention
@@ -1818,35 +1856,27 @@ class Phi3Mini128KModel(Phi3Mini4KModel):
         self.make_greater(greater_name, greater_inputs, shape=[])
         if_name = f"{basename}/If"
         if_cos_cache_output, if_sin_cache_output = "cos_cache", "sin_cache"
+
+        cos_cache_large_node = self.make_node_subgraph("Constant", [], [make_value(cos_cache_large_name, self.io_dtype, cos_cache_large.shape)], name="/large/cos_cache/Constant", value=ir.Tensor(cos_cache_large))
+        sin_cache_large_node = self.make_node_subgraph("Constant", [], [make_value(sin_cache_large_name, self.io_dtype, sin_cache_large.shape)], name="/large/sin_cache/Constant", value=ir.Tensor(sin_cache_large))
+        cos_cache_small_node = self.make_node_subgraph("Constant", [], [make_value(cos_cache_small_name, self.io_dtype, cos_cache_small.shape)], name="/small/cos_cache/Constant", value=ir.Tensor(cos_cache_small))
+        sin_cache_small_node = self.make_node_subgraph("Constant", [], [make_value(sin_cache_small_name, self.io_dtype, sin_cache_small.shape)], name="/small/sin_cache/Constant", value=ir.Tensor(sin_cache_small))
         self.make_node(
-            "If", inputs=[f"{greater_name}/output_0"], outputs=[if_cos_cache_output, if_sin_cache_output], name=if_name,
-            then_branch=self.make_graph(
+            "If",
+            inputs=[f"{greater_name}/output_0"],
+            outputs=[if_cos_cache_output, if_sin_cache_output],
+            name=if_name,
+            then_branch=ir.Graph(
                 name="large_rotemb_caches_graph",
                 inputs=[],
-                outputs=[
-                    helper.make_tensor_value_info(cos_cache_large_name, self.io_dtype, shape=cos_cache_large.shape),
-                    helper.make_tensor_value_info(sin_cache_large_name, self.io_dtype, shape=sin_cache_large.shape),
-                ],
-                initializer=[],
-                value_info=[],
-                nodes=[
-                    helper.make_node("Constant", inputs=[], outputs=[cos_cache_large_name], name="/large/cos_cache/Constant", value=numpy_helper.from_array(cos_cache_large)),
-                    helper.make_node("Constant", inputs=[], outputs=[sin_cache_large_name], name="/large/sin_cache/Constant", value=numpy_helper.from_array(sin_cache_large)),
-                ],
+                outputs=[*cos_cache_large_node.outputs, *sin_cache_large_node.outputs],
+                nodes=[cos_cache_large_node, sin_cache_large_node],
             ),
-            else_branch=self.make_graph(
+            else_branch=ir.Graph(
                 name="small_rotemb_caches_graph",
                 inputs=[],
-                outputs=[
-                    helper.make_tensor_value_info(cos_cache_small_name, self.io_dtype, shape=cos_cache_small.shape),
-                    helper.make_tensor_value_info(sin_cache_small_name, self.io_dtype, shape=sin_cache_small.shape),
-                ],
-                initializer=[],
-                value_info=[],
-                nodes=[
-                    helper.make_node("Constant", inputs=[], outputs=[cos_cache_small_name], name="/small/cos_cache/Constant", value=numpy_helper.from_array(cos_cache_small)),
-                    helper.make_node("Constant", inputs=[], outputs=[sin_cache_small_name], name="/small/sin_cache/Constant", value=numpy_helper.from_array(sin_cache_small)),
-                ],
+                outputs=[*cos_cache_small_node.outputs, *sin_cache_small_node.outputs],
+                nodes=[cos_cache_small_node, sin_cache_small_node],
             ),
         )
         self.make_value_info(if_cos_cache_output, self.io_dtype, shape=["max_sequence_length", "head_dim / 2"])
