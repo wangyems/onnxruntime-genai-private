@@ -10,6 +10,7 @@
 #include "decoder_only.h"
 #include "whisper.h"
 #include "kernels.h"
+#include "ocos.h"
 #include "multi_modal_vision_model.h"
 #if USE_DML
 #include <wil/wrl.h>
@@ -34,6 +35,7 @@ static std::wstring CurrentModulePath() {
 }
 #endif
 
+extern OrtOpLoader genai_op_loader;
 namespace Generators {
 
 State::State(const GeneratorParams& params, const Model& model)
@@ -248,6 +250,13 @@ Model::Model(std::unique_ptr<Config> config) : config_{std::move(config)} {
   run_options_ = OrtRunOptions::Create();
 
   CreateSessionOptions();
+  if (genai_op_loader.GetCustomOps().size() > 0) {
+    custom_op_domain_ = OrtCustomOpDomain::Create("onnx.genai");
+    for (size_t i = 0; i < genai_op_loader.GetCustomOps().size(); i++) {
+      custom_op_domain_->Add(*(genai_op_loader.GetCustomOps().at(i)));
+    }
+    session_options_->Add(*custom_op_domain_);
+  }
 }
 
 Model::~Model() = default;

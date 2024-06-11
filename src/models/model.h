@@ -123,6 +123,7 @@ struct Model : std::enable_shared_from_this<Model> {
   std::unique_ptr<OrtSessionOptions> session_options_;
   std::unique_ptr<OrtSessionOptions> vision_session_options_;
   std::unique_ptr<OrtRunOptions> run_options_;
+  std::unique_ptr<OrtCustomOpDomain> custom_op_domain_;
 
   cuda_stream_holder cuda_stream_;
   DeviceType device_type_{DeviceType::CPU};
