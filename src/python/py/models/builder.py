@@ -234,6 +234,16 @@ class Model:
             "output_0": "",             # Output 0 for MLP layer
         }
 
+        # MoE-specific variables
+        num_experts = config.num_experts if hasattr(config, "num_experts") else 1
+        self.moe_attrs = {
+            "num_experts": num_experts,          # Number of experts in MoE layer
+            "top_k": 1,                          # Number of experts to select in MoE layer
+            "activation_type": "relu",           # Activation function for MoE layer
+            "normalize_routing_weights": False,  # Normalize routing weights in MoE layer
+            "use_sparse_mixer": False,           # Use SparseMixer in MoE layer. Used in Phi3+MoE
+        }
+
         # LM head-specific variables
         self.lm_head_attrs = {
             "scale": 1,                 # Scale value to multiply output of LM head by
