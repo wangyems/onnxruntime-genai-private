@@ -8,7 +8,6 @@ Run this script to create the desired ONNX model.
 """
 
 from onnx import helper, numpy_helper, TensorProto, external_data_helper, save_model
-from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import numpy as np
 import torch
@@ -156,6 +155,7 @@ class Model:
         partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
         rope_theta = config.rope_theta if hasattr(config, "rope_theta") else config.rope_embedding_base if hasattr(config, "rope_embedding_base") else 10000
         self.rotemb_attrs = {
+            "rotemb_name": "rotary_emb",                     # Name of module that includes rotary embeddings
             "create_rotary_embedding_caches": True,          # Create cos/sin caches for rotary embeddings
             "cache_length": self.context_length,             # Cache length to use when creating cos/sin caches for rotary embeddings
             "theta": rope_theta,                             # Base value if calculating cos/sin caches from scratch
@@ -235,14 +235,15 @@ class Model:
         }
 
         # MoE-specific variables
-        num_experts = config.num_experts if hasattr(config, "num_experts") else 1
-        self.moe_attrs = {
-            "num_experts": num_experts,          # Number of experts in MoE layer
-            "top_k": 1,                          # Number of experts to select in MoE layer
-            "activation_type": "relu",           # Activation function for MoE layer
-            "normalize_routing_weights": False,  # Normalize routing weights in MoE layer
-            "use_sparse_mixer": False,           # Use SparseMixer in MoE layer. Used in Phi3+MoE
-        }
+        self.moe_attrs = {}
+        if hasattr(config, "num_experts"):
+            self.moe_attrs = {
+                "num_experts": config.num_experts,   # Number of experts in MoE layer
+                "top_k": 1,                          # Number of experts to select in MoE layer
+                "activation_type": "relu",           # Activation function for MoE layer
+                "normalize_routing_weights": False,  # Normalize routing weights in MoE layer
+                "use_sparse_mixer": False,           # Use SparseMixer in MoE layer. Used in Phi3+MoE
+            }
 
         # LM head-specific variables
         self.lm_head_attrs = {
@@ -391,6 +392,7 @@ class Model:
         )
 
     def to_int4(self, model):
+        from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer
         quant = MatMul4BitsQuantizer(
             model=model,
             block_size=self.quant_attrs["int4"]["block_size"],
@@ -1291,14 +1293,15 @@ class Model:
 
         # Make RotaryEmbedding nodes
         cos_cache_name, sin_cache_name = "", ""
+        attention_rotary_emb = getattr(attention, self.rotemb_attrs["rotemb_name"])
         if self.attention_attrs["use_rotemb_in_attn"]:
-            cos_cache_name, sin_cache_name = self.make_rotary_embedding_caches(attention.rotary_emb)
+            cos_cache_name, sin_cache_name = self.make_rotary_embedding_caches(attention_rotary_emb)
         else:
             q_rotary_name = f"/model/layers.{layer_id}/attn/q_rotary/RotaryEmbedding"
-            self.make_rotary_embedding(attention.rotary_emb, q_rotary_name, root_input=q_input_to_attention, position_ids=kwargs.get("position_ids", "position_ids"))
+            self.make_rotary_embedding(attention_rotary_emb, q_rotary_name, root_input=q_input_to_attention, position_ids=kwargs.get("position_ids", "position_ids"))
             q_input_to_attention = f"{q_rotary_name}/output_0"
             k_rotary_name = f"/model/layers.{layer_id}/attn/k_rotary/RotaryEmbedding"
-            self.make_rotary_embedding(attention.rotary_emb, k_rotary_name, root_input=k_input_to_attention, position_ids=kwargs.get("position_ids", "position_ids"))
+            self.make_rotary_embedding(attention_rotary_emb, k_rotary_name, root_input=k_input_to_attention, position_ids=kwargs.get("position_ids", "position_ids"))
             k_input_to_attention = f"{k_rotary_name}/output_0"
 
         # Make repeat KV nodes (Note: `repeat_kv` needs to be kept since GroupQueryAttention isn't supported for FP32 CUDA)
@@ -1446,6 +1449,73 @@ class Model:
         # Assign output 0 of MLP layer as output of last layer
         self.mlp_attrs["output_0"] = f"{fc2_add_name}/output_0"
 
+    def make_block_sparse_moe(self, layer_id, bsm, root_input):
+        num_experts = self.moe_attrs["num_experts"]
+        top_k = self.moe_attrs["top_k"]
+        activation_type = self.moe_attrs["activation_type"]
+        normalize_routing_weights = self.moe_attrs["normalize_routing_weights"]
+        use_sparse_mixer = self.moe_attrs["use_sparse_mixer"]
+        
+        # Make MoE nodes
+        gate_name = f"/model/layers.{layer_id}/moe/gate/MatMul"
+        self.make_matmul(bsm.gate, gate_name, root_input)
+
+        shape_name = f"/model/layers.{layer_id}/moe/gate/Shape"
+        self.make_shape(shape_name, f"{gate_name}/output_0", shape=[3])
+
+        gather_name = f"/model/layers.{layer_id}/moe/gate/Gather"
+        self.make_gather(gather_name, [f"{shape_name}/output_0", "/model/constants/TensorProto.INT64/0D/2"], axis=0)
+
+        unsqueeze_name = f"/model/layers.{layer_id}/moe/gate/Unsqueeze"
+        self.make_unsqueeze(unsqueeze_name, [f"{gather_name}/output_0", "/model/constants/TensorProto.INT64/1D/0"], dtype=TensorProto.INT64, shape=[1])
+
+        concat_name = f"/model/layers.{layer_id}/moe/gate/Concat"
+        self.make_concat(concat_name, ["/model/constants/TensorProto.INT64/1D/-1", f"{unsqueeze_name}/output_0"], dtype=TensorProto.INT64, shape=[2], axis=0)
+
+        gate_reshape_name = f"/model/layers.{layer_id}/moe/gate/Reshape"
+        self.make_reshape(gate_reshape_name, [f"{gate_name}/output_0", f"{concat_name}/output_0"], dtype=self.io_dtype, shape=['num_rows', num_experts])
+
+        moe_name = f"/model/layers.{layer_id}/moe"
+        w1_list = []
+        w2_list = []
+        w3_list = []
+
+        hidden_size = self.hidden_size
+        inter_size = self.intermediate_size
+
+        for i in range(num_experts):
+            w1_list.append(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)))
+            w2_list.append(torch.reshape(bsm.experts[i].w2.weight, (inter_size, hidden_size)))
+            w3_list.append(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)))
+
+        moe_expert_1_name = f"model.layers.{layer_id}.moe.weight_1"
+        moe_expert_2_name = f"model.layers.{layer_id}.moe.weight_2"
+        moe_expert_3_name = f"model.layers.{layer_id}.moe.weight_3"
+
+        moe_experts_weight1_full = torch.stack(w1_list, dim=0).detach().numpy()
+        moe_experts_weight2_full = torch.stack(w2_list, dim=0).detach().numpy()
+        moe_experts_weight3_full = torch.stack(w3_list, dim=0).detach().numpy()
+
+        moe_experts_weight1 = moe_experts_weight1_full
+        moe_experts_weight2 = moe_experts_weight2_full
+        moe_experts_weight3 = moe_experts_weight3_full
+
+        self.make_external_tensor(moe_experts_weight1.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_1_name)
+        self.make_external_tensor(moe_experts_weight2.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_2_name)
+        self.make_external_tensor(moe_experts_weight3.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_3_name)
+
+        bias_ph = "" # Placeholder for bias
+        inputs = [root_input, f"{gate_reshape_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
+        output = f"{moe_name}/output_0"
+
+        self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
+                        k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights, 
+                        use_sparse_mixer=use_sparse_mixer)
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+
+        # Assign output 0 of previous MoE as root input to next SkipLayerNorm
+        self.layernorm_attrs["skip_input"] = output
+
     def make_activation_with_mul(self, layer_id, root_input, activation, domain):
         # Make nodes for this activation subgraph
         #
@@ -1528,7 +1598,10 @@ class Model:
         self.make_layernorm(layer_id, layer.input_layernorm, skip=not self.layernorm_attrs["first_layernorm"], simple=self.layernorm_attrs["simple"], location="input")
         self.make_attention(layer_id, layer.self_attn, self.layernorm_attrs["output_0"])
         self.make_layernorm(layer_id, layer.post_attention_layernorm, skip=True, simple=self.layernorm_attrs["simple"], location="post_attention")
-        self.make_mlp(layer_id, layer.mlp, self.layernorm_attrs["output_0"])
+        if hasattr(layer, "mlp"):
+            self.make_mlp(layer_id, layer.mlp, self.layernorm_attrs["output_0"])
+        if hasattr(layer, "block_sparse_moe"):
+            self.make_block_sparse_moe(layer_id, layer.block_sparse_moe, self.layernorm_attrs["output_0"])
 
         self.layernorm_attrs["first_layernorm"] = False
         if layer_id == self.num_layers - 1:
@@ -2110,6 +2183,20 @@ class Phi3Mini4KModel(MistralModel):
         super().make_mlp_proj(layer_id, mlp, root_input)
 
 
+class Phi3MoE4KModel(MistralModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.layernorm_attrs["simple"] = False
+
+        self.moe_attrs["num_experts"] = 8
+        self.moe_attrs["top_k"] = 2
+        self.moe_attrs["activation_type"] = "silu"
+        self.moe_attrs["normalize_routing_weights"] = 0
+        self.moe_attrs["use_sparse_mixer"] = 1
+
+        self.rotemb_attrs["rotemb_name"] = "rotary_emb_flash"
+
+
 class Phi3Mini128KModel(Phi3Mini4KModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
@@ -2368,6 +2455,10 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model = Phi3Mini4KModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Phi3ForCausalLM" and config.max_position_embeddings == 131072:
             onnx_model = Phi3Mini128KModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "PhiMoEForCausalLM" and config.max_position_embeddings == 4096:
+            print("WARNING: This model only works for CUDA currently because `MoE` is only supported for CUDA in ONNX Runtime. Setting `--execution_provider cuda` by default.")
+            execution_provider = "cuda"
+            onnx_model = Phi3MoE4KModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Phi3SmallForCausalLM" and config.max_position_embeddings == 8192:
             print("WARNING: This model only works for CUDA currently because `SparseAttention` is only supported for CUDA in ONNX Runtime. Setting `--execution_provider cuda` by default.")
             execution_provider = "cuda"
