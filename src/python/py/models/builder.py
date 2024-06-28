@@ -1455,6 +1455,12 @@ class Model:
         activation_type = self.moe_attrs["activation_type"]
         normalize_routing_weights = self.moe_attrs["normalize_routing_weights"]
         use_sparse_mixer = self.moe_attrs["use_sparse_mixer"]
+
+        print("num_experts: ", num_experts)
+        print("top_k: ", top_k)
+        print("activation_type: ", activation_type)
+        print("normalize_routing_weights: ", normalize_routing_weights)
+        print("use_sparse_mixer: ", use_sparse_mixer)
         
         # Make MoE nodes
         gate_name = f"/model/layers.{layer_id}/moe/gate/MatMul"
@@ -2188,7 +2194,7 @@ class Phi3MoE4KModel(MistralModel):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
         self.layernorm_attrs["simple"] = False
 
-        self.moe_attrs["num_experts"] = 8
+        self.moe_attrs["num_experts"] = 16
         self.moe_attrs["top_k"] = 2
         self.moe_attrs["activation_type"] = "silu"
         self.moe_attrs["normalize_routing_weights"] = 0
