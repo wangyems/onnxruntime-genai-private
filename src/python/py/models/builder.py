@@ -235,6 +235,7 @@ class Model:
         }
 
         # MoE-specific variables
+        # bugbug num_experts may not be a standard name. phi3 team may also change it later.
         self.moe_attrs = {}
         if hasattr(config, "num_experts"):
             self.moe_attrs = {
@@ -644,7 +645,7 @@ class Model:
             # print(f"Quantizing to {self.onnx_dtype} on-the-fly is not currently supported.")
             # print(f"Saving as {self.io_dtype} on-the-fly and quantizing to {self.onnx_dtype} at the end.")
             return self.make_matmul_fp16_or_fp32(matmul, basename, root_input, **kwargs)
-        
+
         name = f"{basename}NBits"
 
         # Input weights are quantized, save quantized MatMul numpy weights for onnx model
@@ -1456,12 +1457,6 @@ class Model:
         normalize_routing_weights = self.moe_attrs["normalize_routing_weights"]
         use_sparse_mixer = self.moe_attrs["use_sparse_mixer"]
 
-        print("num_experts: ", num_experts)
-        print("top_k: ", top_k)
-        print("activation_type: ", activation_type)
-        print("normalize_routing_weights: ", normalize_routing_weights)
-        print("use_sparse_mixer: ", use_sparse_mixer)
-        
         # Make MoE nodes
         gate_name = f"/model/layers.{layer_id}/moe/gate/MatMul"
         self.make_matmul(bsm.gate, gate_name, root_input)
@@ -1515,7 +1510,7 @@ class Model:
         output = f"{moe_name}/output_0"
 
         self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
-                        k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights, 
+                        k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
                         use_sparse_mixer=use_sparse_mixer)
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
@@ -2049,7 +2044,7 @@ class Model:
         self.mask_attrs["total_seq_len"] = cast_2_name
 
     def make_attention_mask_reformatting_for_sparse_attn(self):
-        # Make nodes for the attention mask subgraph that calculates 
+        # Make nodes for the attention mask subgraph that calculates
         # attributes about the 2D attention mask to use in SparseAttention
         #
         #                attention_mask
@@ -2203,6 +2198,12 @@ class Phi3MoE4KModel(MistralModel):
         self.rotemb_attrs["rotemb_name"] = "rotary_emb_flash"
 
 
+class Phi3MoE128KModel(Phi3MoE4KModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.make_rotary_embedding_multi_cache()
+
+
 class Phi3Mini128KModel(Phi3Mini4KModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
@@ -2281,7 +2282,7 @@ class Phi3Small8KModel(Model):
         crows_name = "block_row_indices"
         self.make_external_tensor(crows.detach().numpy().astype(np.int32), crows_name)
         self.mask_attrs["block_row_indices"] = crows_name
-        
+
         cols_name = "block_col_indices"
         self.make_external_tensor(cols.detach().numpy().astype(np.int32), cols_name)
         self.mask_attrs["block_col_indices"] = cols_name
@@ -2351,7 +2352,7 @@ class Phi3Small8KModel(Model):
         #           DownProjMatMul
         #                 |
         #            DownProjAdd
-        
+
         # Make input MatMul and Add nodes
         up_matmul_name = f"/model/layers.{layer_id}/mlp/up_proj/MatMul"
         self.make_matmul(mlp.up_proj.weight.detach().numpy(), up_matmul_name, root_input)
@@ -2465,6 +2466,10 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             print("WARNING: This model only works for CUDA currently because `MoE` is only supported for CUDA in ONNX Runtime. Setting `--execution_provider cuda` by default.")
             execution_provider = "cuda"
             onnx_model = Phi3MoE4KModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "PhiMoEForCausalLM" and config.max_position_embeddings == 131072:
+            print("WARNING: This model only works for CUDA currently because `MoE` is only supported for CUDA in ONNX Runtime. Setting `--execution_provider cuda` by default.")
+            execution_provider = "cuda"
+            onnx_model = Phi3MoE128KModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Phi3SmallForCausalLM" and config.max_position_embeddings == 8192:
             print("WARNING: This model only works for CUDA currently because `SparseAttention` is only supported for CUDA in ONNX Runtime. Setting `--execution_provider cuda` by default.")
             execution_provider = "cuda"
