@@ -2201,6 +2201,8 @@ class Phi3MoE4KModel(MistralModel):
 class Phi3MoE128KModel(Phi3MoE4KModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.rotemb_attrs["rotemb_name"] = "rotary_emb"
+
         self.make_rotary_embedding_multi_cache()
 
 
