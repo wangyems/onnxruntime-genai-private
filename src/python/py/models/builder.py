@@ -43,6 +43,9 @@ class Model:
         self.filename = extra_options["filename"] if "filename" in extra_options else "model.onnx"
         self.extra_options = extra_options
 
+        self.world_size = int(extra_options["world_size"]) if "world_size" in extra_options else 1
+        self.rank = int(extra_options["rank"]) if "rank" in extra_options else 0
+
         self.inputs = []
         self.outputs = []
         self.initializers = []
@@ -76,8 +79,10 @@ class Model:
             "attention_mask": ["batch_size", "total_sequence_length"],                                           # For standard models
             "position_ids": ["batch_size", "sequence_length"],                                                   # For standard models
             "inputs_embeds": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the embedding layer from the model (note that `inputs_embeds` is written this way to match Hugging Face format)
-            "past_key_values.key": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
-            "past_key_values.value": ["batch_size", self.num_kv_heads, "past_sequence_length", self.head_size],  # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
+            "past_key_values.key": 
+                ["batch_size", self.num_kv_heads // self.world_size, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.key` is written this way to match Hugging Face format)
+            "past_key_values.value": 
+                ["batch_size", self.num_kv_heads // self.world_size, "past_sequence_length", self.head_size],    # For standard models (note that `past_key_values.value` is written this way to match Hugging Face format)
         }
         self.exclude_embeds = "exclude_embeds" in extra_options
         if self.exclude_embeds:
@@ -94,8 +99,10 @@ class Model:
         self.output_shapes = {
             "hidden_states": ["batch_size", "sequence_length", self.hidden_size],                                # For standard models where you want to remove the language modeling head from the model (note that `hidden_states` is written this way to match Hugging Face format)
             "logits": ["batch_size", "sequence_length", self.vocab_size],                                        # For standard models
-            "present.key": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],           # For standard models (note that `present.key` is written this way to match Hugging Face format)
-            "present.value": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_size],         # For standard models (note that `present.value` is written this way to match Hugging Face format)
+            "present.key": 
+                ["batch_size", self.num_kv_heads // self.world_size, "total_sequence_length", self.head_size],   # For standard models (note that `present.key` is written this way to match Hugging Face format)
+            "present.value": 
+                ["batch_size", self.num_kv_heads // self.world_size, "total_sequence_length", self.head_size],   # For standard models (note that `present.value` is written this way to match Hugging Face format)
         }
         self.exclude_lm_head = "exclude_lm_head" in extra_options
         if self.exclude_lm_head:
@@ -196,6 +203,10 @@ class Model:
         homo_head = config.blocksparse_homo_head_pattern if hasattr(config, "blocksparse_homo_head_pattern") else False
         self.attention_attrs = {
             "op_type": "MultiHeadAttention",                 # Attention op to use
+            "num_heads": 
+                self.num_attn_heads // self.world_size,      # Number of heads in Sharded Attention 
+            "kv_num_heads": 
+                self.num_kv_heads // self.world_size,        # Number of kv heads in Sharded Attention
             "scale": 1 / np.sqrt(self.head_size),            # Scale value after calculating Q x K' in attention
             "use_rotemb_in_attn": False,                     # Use rotary embeddings within attention (instead of a separate RotaryEmbedding op)
             "use_packed_matmul": False,                      # Use packed MatMul (instead of 3 separate MatMuls for Q/K/V)
@@ -491,6 +502,37 @@ class Model:
 
         self.inputs = inputs
         self.outputs = outputs
+
+    def make_shard(self, weight, sharding_axis=0):
+        # Shard 1D or 2D weights along specified axis.
+        if torch.is_tensor(weight):
+            weight = weight.detach().numpy()
+
+        if self.world_size == 1:
+            return weight
+        
+        assert len(weight.shape) == 1 or len(weight.shape) == 2, "Only 1D or 2D weights are supported"
+        if len(weight.shape) == 1:
+            assert sharding_axis == 0, "Sharding axis must be 0 for 1D weights"
+        if len(weight.shape) == 2:
+            assert sharding_axis == 0 or sharding_axis == 1, "Sharding axis must be 0 or 1 for 2D weights"
+
+        local_dim = weight.shape[sharding_axis] // self.world_size
+        idx_start = self.rank * local_dim
+        idx_end = idx_start + local_dim
+
+        if len(weight.shape) == 1:
+            return weight[idx_start : idx_end]
+
+        if sharding_axis == 0:
+            return weight[idx_start : idx_end, :]
+        
+        return weight[:, idx_start : idx_end]
+
+    def make_all_reduce(self, name, root_input, dtype, shape):
+        output = f"{name}/output_0"
+        self.make_node("AllReduce", inputs=[root_input], outputs=[output], name=name, domain="com.microsoft")
+        self.make_value_info(output, dtype, shape=shape)
 
     def make_constant(self, name):
         # Make constant ops for 0, 1, 2, 3, etc.
@@ -901,7 +943,7 @@ class Model:
         inputs = [root_input, kwargs.pop("position_ids"), cos_cache_name, sin_cache_name]
         output = f"{name}/output_0"
         self.make_node("RotaryEmbedding", inputs=inputs, outputs=[output], name=name, domain="com.microsoft", interleaved=self.rotemb_attrs["interleaved"], **kwargs)
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * (self.num_kv_heads if "k_rotary" in name else self.num_attn_heads)])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', (self.head_size * (self.num_kv_heads if "k_rotary" in name else self.num_attn_heads)) // self.world_size])
 
     def make_rotary_embedding_multi_cache(self):
         # Create dummy rotary embedding class
@@ -1175,9 +1217,9 @@ class Model:
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
         self.make_node(
             "MultiHeadAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft",
-            num_heads=self.num_attn_heads, scale=self.attention_attrs["scale"],
+            num_heads=self.attention_attrs["num_heads"], scale=self.attention_attrs["scale"],
         )
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.attention_attrs["num_heads"]])
 
     def make_group_query_attention(self, name, **kwargs):
         inputs = [
@@ -1190,10 +1232,10 @@ class Model:
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
         self.make_node(
             "GroupQueryAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft",
-            num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, scale=self.attention_attrs["scale"], # local_window_size=self.window_size,  # Disable sliding window attribute temporarily
+            num_heads=self.attention_attrs["num_heads"], kv_num_heads=self.attention_attrs["kv_num_heads"], scale=self.attention_attrs["scale"], # local_window_size=self.window_size,  # Disable sliding window attribute temporarily
             do_rotary=self.attention_attrs["use_rotemb_in_attn"], rotary_interleaved=self.rotemb_attrs["interleaved"],
         )
-        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.num_attn_heads])
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.head_size * self.attention_attrs["num_heads"]])
 
     def make_sparse_attention(self, name, **kwargs):
         inputs = [
@@ -1207,7 +1249,7 @@ class Model:
         outputs = [output, kwargs.get("present_k", ""), kwargs.get("present_v", "")]
         self.make_node(
             "SparseAttention", inputs=inputs, outputs=outputs, name=name, domain="com.microsoft",
-            num_heads=self.num_attn_heads, kv_num_heads=self.num_kv_heads, scale=self.attention_attrs["scale"], sparse_block_size=self.attention_attrs["block_sparse"]["sparse_block_size"],
+            num_heads=self.attention_attrs["num_heads"], kv_num_heads=self.attention_attrs["kv_num_heads"], scale=self.attention_attrs["scale"], sparse_block_size=self.attention_attrs["block_sparse"]["sparse_block_size"],
             do_rotary=self.attention_attrs["use_rotemb_in_attn"], rotary_interleaved=self.rotemb_attrs["interleaved"],
         )
 
