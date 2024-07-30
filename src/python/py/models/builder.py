@@ -1549,21 +1549,64 @@ class Model:
         gate_reshape_name = gate_ops_base + "Reshape"
         self.make_reshape(gate_reshape_name, [f"{gate_name}/output_0", f"{concat_name}/output_0"], dtype=self.io_dtype, shape=['num_rows', num_experts])
 
-        w1_list = []
-        w2_list = []
-        w3_list = []
-
         hidden_size = self.hidden_size
         inter_size = self.intermediate_size
 
-        for i in range(num_experts):
-            w1_list.append(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)))
-            w2_list.append(torch.reshape(bsm.experts[i].w2.weight, (inter_size, hidden_size)))
-            w3_list.append(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)))
+        def quant_dequant(weights, quant_mode: bool = True):
+            # use the test version `_symmetric_...` to get the non-interleaved weights
+            type = torch.quint4x2 if quant_mode else torch.int8
+            import tensorrt_llm
 
-        moe_expert_1_name = f"model.layers.{layer_id}.moe.weight_1"
-        moe_expert_2_name = f"model.layers.{layer_id}.moe.weight_2"
-        moe_expert_3_name = f"model.layers.{layer_id}.moe.weight_3"
+            quant_weights, processed_q_weight, torch_weight_scales = (
+                torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
+            )
+
+            # Unpack the int4s int int8s
+            if quant_mode:
+                upper = quant_weights >> 4
+                lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
+                quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
+
+            quant_weights = quant_weights.to(dtype=weights.dtype)
+            result = torch.multiply(quant_weights, torch_weight_scales.unsqueeze(0)).T.contiguous()
+            return torch_weight_scales.to(torch.float16), processed_q_weight, result.to(device=weights.device)
+
+        use_qmoe = True if self.onnx_dtype == 'int4' else False
+
+        w1_list = []
+        w2_list = []
+        w3_list = []
+        w1_scale_list = []
+        w2_scale_list = []
+        w3_scale_list = []
+
+        if not use_qmoe:
+            for i in range(num_experts):
+                w1_list.append(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)))
+                w2_list.append(torch.reshape(bsm.experts[i].w2.weight, (inter_size, hidden_size)))
+                w3_list.append(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)))
+        else:
+            for i in range(num_experts):
+                # Quantize the weights with uint8
+                w1_scale, pre_qweight1, _ = quant_dequant(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)), False)
+                w2_scale, pre_qweight2, _ = quant_dequant(torch.reshape(bsm.experts[i].w2.weight, (hidden_size, inter_size)), False)
+                w3_scale, pre_qweight3, _ = quant_dequant(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)), False)
+
+                w1_list.append(pre_qweight1)
+                w2_list.append(pre_qweight2)
+                w3_list.append(pre_qweight3)
+
+                w1_scale_list.append(w1_scale)
+                w2_scale_list.append(w2_scale)
+                w3_scale_list.append(w3_scale)
+
+        moe_expert_weight_1_name = f"model.layers.{layer_id}.moe.weight_1"
+        moe_expert_weight_2_name = f"model.layers.{layer_id}.moe.weight_2"
+        moe_expert_weight_3_name = f"model.layers.{layer_id}.moe.weight_3"
+
+        moe_expert_scales_1_name = f"model.layers.{layer_id}.moe.scales_1"
+        moe_expert_scales_2_name = f"model.layers.{layer_id}.moe.scales_2"
+        moe_expert_scales_3_name = f"model.layers.{layer_id}.moe.scales_3"
 
         def get_fc1_tensor_shards(expert_weights):
             return (
@@ -1585,26 +1628,44 @@ class Model:
 
         def make_moe_external_tensor(w_list, moe_expert_name, functor):
             moe_experts_weight = torch.stack(w_list, dim=0).detach().numpy()
-            if self.world_size > 1:
+            if self.world_size > 1 and functor is not None:
                 moe_experts_weight = functor(moe_experts_weight)
             self.make_external_tensor(moe_experts_weight.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_name)
 
-        make_moe_external_tensor(w1_list, moe_expert_1_name, get_fc1_tensor_shards)
-        make_moe_external_tensor(w2_list, moe_expert_2_name, get_fc2_tensor_shards)
-        make_moe_external_tensor(w3_list, moe_expert_3_name, get_fc1_tensor_shards)
+        make_moe_external_tensor(w1_list, moe_expert_weight_1_name, get_fc1_tensor_shards)
+        make_moe_external_tensor(w2_list, moe_expert_weight_2_name, get_fc2_tensor_shards)
+        make_moe_external_tensor(w3_list, moe_expert_weight_3_name, get_fc1_tensor_shards)
+
+        if use_qmoe:
+            # Currently we don't expect QMoE to be used with distributed inference
+            make_moe_external_tensor(w1_scale_list, moe_expert_scales_1_name, None)
+            make_moe_external_tensor(w2_scale_list, moe_expert_scales_2_name, None)
+            make_moe_external_tensor(w3_scale_list, moe_expert_scales_3_name, None)
 
         bias_ph = "" # Placeholder for bias
-        inputs = [root_input, f"{gate_reshape_name}/output_0", moe_expert_1_name, bias_ph, moe_expert_2_name, bias_ph, moe_expert_3_name]
+        inputs = None
+        if not use_qmoe:
+            inputs = [root_input, f"{gate_reshape_name}/output_0", \
+                      moe_expert_1_name, bias_ph, \
+                      moe_expert_2_name, bias_ph, \
+                      moe_expert_3_name]
+        else:
+            inputs = [root_input, f"{gate_reshape_name}/output_0", \
+                      moe_expert_1_name, moe_expert_scales_1_name, bias_ph, \
+                      moe_expert_2_name, moe_expert_scales_2_name, bias_ph, \
+                      moe_expert_3_name, moe_expert_scales_3_name]
         output = f"{moe_name}/output_0"
 
         if self.world_size > 1:
+            assert not use_qmoe, "Quantized MoE is not supported with distributed inference"
             self.make_node("ShardedMoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
                             k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
                             use_sparse_mixer=use_sparse_mixer, tensor_shards=self.world_size)
         else:
-            self.make_node("MoE", inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
-                            k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
-                            use_sparse_mixer=use_sparse_mixer)
+            op_type = "MoE" if not use_qmoe else "QMoE8Bits"
+            self.make_node(op_type, inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
+                           k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
+                           use_sparse_mixer=use_sparse_mixer)
 
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
