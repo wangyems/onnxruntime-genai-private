@@ -1557,21 +1557,13 @@ class Model:
             type = torch.quint4x2 if quant_mode else torch.int8
             import tensorrt_llm
 
-            quant_weights, processed_q_weight, torch_weight_scales = (
+            _, processed_q_weight, torch_weight_scales = (
                 torch.ops.trtllm._symmetric_quantize_last_axis_of_batched_matrix(weights.T.cpu().contiguous(), type)
             )
 
-            # Unpack the int4s int int8s
-            if quant_mode:
-                upper = quant_weights >> 4
-                lower = (quant_weights << 4) >> 4  # Arithmetic right shift sign extends
-                quant_weights = torch.stack((lower, upper), dim=2).view(weights.T.shape)
+            return torch_weight_scales.to(torch.float16), processed_q_weight
 
-            quant_weights = quant_weights.to(dtype=weights.dtype)
-            result = torch.multiply(quant_weights, torch_weight_scales.unsqueeze(0)).T.contiguous()
-            return torch_weight_scales.to(torch.float16), processed_q_weight, result.to(device=weights.device)
-
-        use_qmoe = True if self.onnx_dtype == 'int4' else False
+        use_qmoe = True #if self.onnx_dtype == 'int4' else False
 
         w1_list = []
         w2_list = []
@@ -1588,9 +1580,9 @@ class Model:
         else:
             for i in range(num_experts):
                 # Quantize the weights with uint8
-                w1_scale, pre_qweight1, _ = quant_dequant(torch.reshape(bsm.experts[i].w1.weight, (hidden_size, inter_size)), False)
-                w2_scale, pre_qweight2, _ = quant_dequant(torch.reshape(bsm.experts[i].w2.weight, (hidden_size, inter_size)), False)
-                w3_scale, pre_qweight3, _ = quant_dequant(torch.reshape(bsm.experts[i].w3.weight, (hidden_size, inter_size)), False)
+                w1_scale, pre_qweight1= quant_dequant(bsm.experts[i].w1.weight, False)
+                w2_scale, pre_qweight2= quant_dequant(bsm.experts[i].w2.weight, False)
+                w3_scale, pre_qweight3= quant_dequant(bsm.experts[i].w3.weight, False)
 
                 w1_list.append(pre_qweight1)
                 w2_list.append(pre_qweight2)
@@ -1626,15 +1618,16 @@ class Model:
                 .transpose(0, 2, 1).reshape(-1, inter_size // self.world_size, hidden_size)
             )
 
-        def make_moe_external_tensor(w_list, moe_expert_name, functor):
+        def make_moe_external_tensor(w_list, moe_expert_name, functor, use_qmoe=False):
             moe_experts_weight = torch.stack(w_list, dim=0).detach().numpy()
             if self.world_size > 1 and functor is not None:
                 moe_experts_weight = functor(moe_experts_weight)
-            self.make_external_tensor(moe_experts_weight.astype(self.to_numpy_dtype[self.io_dtype]), moe_expert_name)
+            numpy_type = np.uint8 if use_qmoe else self.to_numpy_dtype[self.io_dtype]
+            self.make_external_tensor(moe_experts_weight.astype(numpy_type), moe_expert_name)
 
-        make_moe_external_tensor(w1_list, moe_expert_weight_1_name, get_fc1_tensor_shards)
-        make_moe_external_tensor(w2_list, moe_expert_weight_2_name, get_fc2_tensor_shards)
-        make_moe_external_tensor(w3_list, moe_expert_weight_3_name, get_fc1_tensor_shards)
+        make_moe_external_tensor(w1_list, moe_expert_weight_1_name, get_fc1_tensor_shards, use_qmoe)
+        make_moe_external_tensor(w2_list, moe_expert_weight_2_name, get_fc2_tensor_shards, use_qmoe)
+        make_moe_external_tensor(w3_list, moe_expert_weight_3_name, get_fc1_tensor_shards, use_qmoe)
 
         if use_qmoe:
             # Currently we don't expect QMoE to be used with distributed inference
@@ -1646,14 +1639,14 @@ class Model:
         inputs = None
         if not use_qmoe:
             inputs = [root_input, f"{gate_reshape_name}/output_0", \
-                      moe_expert_1_name, bias_ph, \
-                      moe_expert_2_name, bias_ph, \
-                      moe_expert_3_name]
+                      moe_expert_weight_1_name, bias_ph, \
+                      moe_expert_weight_2_name, bias_ph, \
+                      moe_expert_weight_3_name]
         else:
             inputs = [root_input, f"{gate_reshape_name}/output_0", \
-                      moe_expert_1_name, moe_expert_scales_1_name, bias_ph, \
-                      moe_expert_2_name, moe_expert_scales_2_name, bias_ph, \
-                      moe_expert_3_name, moe_expert_scales_3_name]
+                      moe_expert_weight_1_name, moe_expert_scales_1_name, bias_ph, \
+                      moe_expert_weight_2_name, moe_expert_scales_2_name, bias_ph, \
+                      moe_expert_weight_3_name, moe_expert_scales_3_name]
         output = f"{moe_name}/output_0"
 
         if self.world_size > 1:
