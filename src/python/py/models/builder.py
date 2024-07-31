@@ -255,6 +255,7 @@ class Model:
                 "activation_type": "relu",           # Activation function for MoE layer
                 "normalize_routing_weights": False,  # Normalize routing weights in MoE layer
                 "use_sparse_mixer": False,           # Use SparseMixer in MoE layer. Used in Phi3+MoE
+                "use_int4": False,                   # Use INT4 quantization in MoE layer, otherwise use INT8
             }
 
         # LM head-specific variables
@@ -1526,6 +1527,7 @@ class Model:
         activation_type = self.moe_attrs["activation_type"]
         normalize_routing_weights = self.moe_attrs["normalize_routing_weights"]
         use_sparse_mixer = self.moe_attrs["use_sparse_mixer"]
+        use_int4 = self.moe_attrs["use_int4"]
 
         gate_ops_base = f"/model/layers.{layer_id}/moe/gate/"
         moe_name = f"/model/layers.{layer_id}/moe"
@@ -1580,9 +1582,9 @@ class Model:
         else:
             for i in range(num_experts):
                 # Quantize the weights with uint8
-                w1_scale, pre_qweight1= quant_dequant(bsm.experts[i].w1.weight, False)
-                w2_scale, pre_qweight2= quant_dequant(bsm.experts[i].w2.weight, False)
-                w3_scale, pre_qweight3= quant_dequant(bsm.experts[i].w3.weight, False)
+                w1_scale, pre_qweight1= quant_dequant(bsm.experts[i].w1.weight, use_int4)
+                w2_scale, pre_qweight2= quant_dequant(bsm.experts[i].w2.weight, use_int4)
+                w3_scale, pre_qweight3= quant_dequant(bsm.experts[i].w3.weight, use_int4)
 
                 w1_list.append(pre_qweight1)
                 w2_list.append(pre_qweight2)
@@ -1655,7 +1657,7 @@ class Model:
                             k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
                             use_sparse_mixer=use_sparse_mixer, tensor_shards=self.world_size)
         else:
-            op_type = "MoE" if not use_qmoe else "QMoE8Bits"
+            op_type = "MoE" if not use_qmoe else ("QMoE8Bits" if not use_int4 else "QMoE4Bits")
             self.make_node(op_type, inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
                            k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
                            use_sparse_mixer=use_sparse_mixer)
@@ -2342,6 +2344,7 @@ class Phi3MoE4KModel(MistralModel):
         self.moe_attrs["activation_type"] = "silu"
         self.moe_attrs["normalize_routing_weights"] = 0
         self.moe_attrs["use_sparse_mixer"] = 1
+        self.moe_attrs["use_int4"] = 0
 
         self.rotemb_attrs["rotemb_name"] = "rotary_emb_flash"
 
