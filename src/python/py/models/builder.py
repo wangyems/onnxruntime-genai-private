@@ -2344,7 +2344,7 @@ class Phi3MoE4KModel(MistralModel):
         self.moe_attrs["activation_type"] = "silu"
         self.moe_attrs["normalize_routing_weights"] = 0
         self.moe_attrs["use_sparse_mixer"] = 1
-        self.moe_attrs["use_int4"] = 0
+        self.moe_attrs["use_int4"] = 1
 
         self.rotemb_attrs["rotemb_name"] = "rotary_emb_flash"
 
