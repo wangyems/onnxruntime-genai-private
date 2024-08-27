@@ -1657,10 +1657,10 @@ class Model:
                             k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
                             use_sparse_mixer=use_sparse_mixer, tensor_shards=self.world_size)
         else:
-            op_type = "MoE" if not use_qmoe else ("QMoE8Bits" if not use_int4 else "QMoE4Bits")
+            op_type = "MoE" if not use_qmoe else "QMoE"
             self.make_node(op_type, inputs=inputs, outputs=[output], name=moe_name, domain="com.microsoft",
                            k=top_k, activation_type=activation_type, normalize_routing_weights=normalize_routing_weights,
-                           use_sparse_mixer=use_sparse_mixer)
+                           use_sparse_mixer=use_sparse_mixer, expert_weight_bits=(4 if use_int4 else 8))
 
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
 
